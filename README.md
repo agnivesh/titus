@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/praetorian-inc/titus/ci.yml?branch=main&label=CI)](https://github.com/praetorian-inc/titus/actions)
 
-**Titus** is a high-performance secrets scanner that detects credentials, API keys, and tokens in source code, files, and git history. It ships with 459 detection rules covering hundreds of services and credential types, drawn from [NoseyParker](https://github.com/praetorian-inc/noseyparker) and [Kingfisher](https://github.com/mongodb/kingfisher). Titus runs as a CLI, a Go library, a Burp Suite extension, and a Chrome browser extension — all sharing the same detection engine and rule set.
+**Titus** is a high-performance secrets scanner that detects credentials, API keys, and tokens in source code, files, and git history. It ships with 484 detection rules covering hundreds of services and credential types, drawn from [NoseyParker](https://github.com/praetorian-inc/noseyparker) and [Kingfisher](https://github.com/mongodb/kingfisher). Titus runs as a CLI, a Go library, a Burp Suite extension, and a Chrome browser extension — all sharing the same detection engine and rule set.
 
 Built for security engineers, penetration testers, and DevSecOps teams, Titus combines [Hyperscan](https://github.com/intel/hyperscan)/[Vectorscan](https://github.com/VectorCamp/vectorscan)-accelerated regex matching with live credential validation to find and verify leaked secrets across your entire codebase.
 
@@ -26,7 +26,7 @@ Built for security engineers, penetration testers, and DevSecOps teams, Titus co
 ## Why Titus?
 
 - **Fast secrets scanning**: Regex matching accelerated by [Hyperscan](https://github.com/intel/hyperscan)/[Vectorscan](https://github.com/VectorCamp/vectorscan) when available, with a pure-Go fallback for portability on any platform.
-- **Broad credential detection coverage**: 459 rules detect API keys, tokens, and credentials for AWS, GCP, Azure, GitHub, Slack, databases, CI/CD systems, and hundreds more services.
+- **Broad credential detection coverage**: 484 rules detect API keys, tokens, and credentials for AWS, GCP, Azure, GitHub, Slack, databases, CI/CD systems, and hundreds more services.
 - **Live secret validation**: Detected secrets are checked against their source APIs to confirm whether they are active, reducing false positives and prioritizing remediation.
 - **Multiple interfaces for every workflow**: Scan from the CLI, embed as a Go library, passively scan HTTP traffic in Burp Suite, or scan web pages in Chrome during application security testing.
 - **Binary file extraction**: Extract and scan secrets from Office documents, PDFs, archives (zip, tar, 7z), mobile apps (APK, IPA), browser extensions, and more.
