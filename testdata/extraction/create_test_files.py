@@ -21,7 +21,7 @@ from pathlib import Path
 SECRET_KEY = "AKIATESTKEY1234567890"
 
 # Output directory
-OUTPUT_DIR = Path(__file__).parent / "testdata" / "extraction"
+OUTPUT_DIR = "."
 
 
 def create_xlsx():
