@@ -17,7 +17,7 @@ import javax.swing.table.TableRowSorter;
 import javax.swing.RowFilter;
 import java.awt.*;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
+import java.util.*;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -46,9 +46,10 @@ public class SecretsView extends JPanel {
     private JButton falsePositiveButton;
     private JButton unmarkFPButton;
     private JButton copyButton;
-    private JButton refreshButton;
     private JLabel selectionLabel;
     private JPopupMenu tableContextMenu;
+    private final Map<Integer, javax.swing.table.TableColumn> allColumns = new LinkedHashMap<>();
+    private final Set<Integer> hiddenColumns = new HashSet<>();
 
     // Filter components
     private JTextField searchField;
@@ -97,6 +98,7 @@ public class SecretsView extends JPanel {
 
         // Create table with row sorter for filtering and sorting
         secretsTable = new JTable(tableModel);
+        secretsTable.setShowVerticalLines(false);
         rowSorter = new TableRowSorter<>(tableModel);
         secretsTable.setRowSorter(rowSorter);
 
@@ -113,12 +115,25 @@ public class SecretsView extends JPanel {
         secretsTable.getTableHeader().setResizingAllowed(true);
         secretsTable.getSelectionModel().addListSelectionListener(this::onSelectionChanged);
 
+        // Ctrl+A / Cmd+A to select all
+        secretsTable.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_A, java.awt.Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()),
+            "selectAll"
+        );
+        secretsTable.getActionMap().put("selectAll", new javax.swing.AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) { selectAll(); }
+        });
+
         // Configure column widths
         configureColumnWidths();
 
-        // Right-click context menu
+        // Right-click context menu for table rows
         createTableContextMenu();
         secretsTable.setComponentPopupMenu(tableContextMenu);
+
+        // Right-click context menu on table header for column visibility
+        createHeaderContextMenu();
 
         // Custom renderer for category colors
         secretsTable.setDefaultRenderer(Object.class, new CategoryColorRenderer());
@@ -170,6 +185,120 @@ public class SecretsView extends JPanel {
         secretsTable.getColumnModel().getColumn(7).setPreferredWidth(65);   // Checked
         secretsTable.getColumnModel().getColumn(8).setPreferredWidth(70);   // Result
         secretsTable.getColumnModel().getColumn(9).setPreferredWidth(95);   // False Positive
+
+        // Store references to all columns for visibility toggling
+        for (int i = 0; i < secretsTable.getColumnModel().getColumnCount(); i++) {
+            allColumns.put(i, secretsTable.getColumnModel().getColumn(i));
+        }
+    }
+
+    /**
+     * Create right-click context menu on the table header for column visibility.
+     */
+    private void createHeaderContextMenu() {
+        JPopupMenu headerMenu = new JPopupMenu();
+
+        secretsTable.getTableHeader().addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mousePressed(java.awt.event.MouseEvent e) { showIfPopup(e); }
+            @Override
+            public void mouseReleased(java.awt.event.MouseEvent e) { showIfPopup(e); }
+            private void showIfPopup(java.awt.event.MouseEvent e) {
+                if (!e.isPopupTrigger()) return;
+                headerMenu.removeAll();
+                for (int i = 0; i < COLUMN_NAMES.length; i++) {
+                    if (i == 0) continue; // # always visible
+                    final int colIndex = i;
+                    JCheckBoxMenuItem item = new JCheckBoxMenuItem(COLUMN_NAMES[i], !hiddenColumns.contains(colIndex));
+                    item.addActionListener(a -> toggleColumn(colIndex));
+                    headerMenu.add(item);
+                }
+                headerMenu.show(e.getComponent(), e.getX(), e.getY());
+            }
+        });
+    }
+
+    private static final String[] COLUMN_NAMES = {"#", "Type", "Severity", "Secret Preview", "Host", "Path", "Count", "Checked", "Result", "False Positive"};
+
+    /**
+     * Show column visibility popup from the Columns button.
+     */
+    private JWindow columnsWindow;
+
+    private void showColumnsPopup(JButton anchor) {
+        // Close existing popup if open
+        if (columnsWindow != null && columnsWindow.isVisible()) {
+            columnsWindow.dispose();
+            columnsWindow = null;
+            return;
+        }
+
+        // Use a JWindow with checkboxes — stays open on click
+        java.awt.Window parentWindow = SwingUtilities.getWindowAncestor(anchor);
+        columnsWindow = new JWindow(parentWindow);
+
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color.GRAY),
+            BorderFactory.createEmptyBorder(4, 4, 4, 4)
+        ));
+
+        for (int i = 0; i < COLUMN_NAMES.length; i++) {
+            if (i == 0) continue; // # always visible
+            final int colIndex = i;
+            JCheckBox cb = new JCheckBox(COLUMN_NAMES[i], !hiddenColumns.contains(colIndex));
+            cb.addActionListener(a -> toggleColumn(colIndex));
+            panel.add(cb);
+        }
+
+        columnsWindow.setContentPane(panel);
+        columnsWindow.pack();
+
+        // Position below the anchor button
+        java.awt.Point loc = anchor.getLocationOnScreen();
+        columnsWindow.setLocation(loc.x, loc.y + anchor.getHeight());
+        columnsWindow.setVisible(true);
+
+        // Close when clicking outside
+        columnsWindow.addWindowFocusListener(new java.awt.event.WindowFocusListener() {
+            @Override
+            public void windowGainedFocus(java.awt.event.WindowEvent e) {}
+            @Override
+            public void windowLostFocus(java.awt.event.WindowEvent e) {
+                if (columnsWindow != null) {
+                    columnsWindow.dispose();
+                    columnsWindow = null;
+                }
+            }
+        });
+    }
+
+    /**
+     * Toggle column visibility.
+     */
+    private void toggleColumn(int modelIndex) {
+        javax.swing.table.TableColumn col = allColumns.get(modelIndex);
+        if (col == null) return;
+
+        if (hiddenColumns.contains(modelIndex)) {
+            // Show column — insert at the right position
+            hiddenColumns.remove(modelIndex);
+            // Find the correct insert position based on model order
+            int insertPos = 0;
+            for (int i = 0; i < modelIndex; i++) {
+                if (!hiddenColumns.contains(i)) insertPos++;
+            }
+            secretsTable.getColumnModel().addColumn(col);
+            int currentPos = secretsTable.getColumnModel().getColumnCount() - 1;
+            if (insertPos < currentPos) {
+                secretsTable.getColumnModel().moveColumn(currentPos, insertPos);
+            }
+        } else {
+            // Hide column
+            hiddenColumns.add(modelIndex);
+            secretsTable.getColumnModel().removeColumn(col);
+        }
     }
 
     /**
@@ -204,9 +333,6 @@ public class SecretsView extends JPanel {
         // Left side: action buttons
         JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
 
-        refreshButton = new JButton("Refresh");
-        refreshButton.addActionListener(e -> refresh());
-
         validateButton = new JButton("Validate");
         validateButton.setEnabled(false);
         validateButton.addActionListener(e -> validateSelected());
@@ -226,17 +352,34 @@ public class SecretsView extends JPanel {
         copyButton.setToolTipText("Copy secret value to clipboard");
         copyButton.addActionListener(e -> copySelectedSecret());
 
-        leftPanel.add(refreshButton);
+        JButton selectAllButton = new JButton("Select All");
+        selectAllButton.setToolTipText("Select all visible secrets (Ctrl+A)");
+        selectAllButton.addActionListener(e -> selectAll());
+
+        leftPanel.add(selectAllButton);
         leftPanel.add(validateButton);
         leftPanel.add(falsePositiveButton);
         leftPanel.add(unmarkFPButton);
         leftPanel.add(copyButton);
 
-        // Right side: selection indicator
-        JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+        // Right side: selection indicator with help text
+        JPanel rightInner = new JPanel();
+        rightInner.setLayout(new BoxLayout(rightInner, BoxLayout.Y_AXIS));
+
         selectionLabel = new JLabel("");
         selectionLabel.setFont(selectionLabel.getFont().deriveFont(Font.BOLD));
-        rightPanel.add(selectionLabel);
+        selectionLabel.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        rightInner.add(selectionLabel);
+
+        String shortcutKey = System.getProperty("os.name").toLowerCase().contains("mac") ? "\u2318" : "Ctrl";
+        JLabel helpLabel = new JLabel(shortcutKey + "+click for multiple \u2022 Shift+click for range");
+        helpLabel.setFont(helpLabel.getFont().deriveFont(Font.PLAIN, 11f));
+        helpLabel.setForeground(Color.GRAY);
+        helpLabel.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        rightInner.add(helpLabel);
+
+        JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+        rightPanel.add(rightInner);
 
         toolbar.add(leftPanel, BorderLayout.WEST);
         toolbar.add(rightPanel, BorderLayout.EAST);
@@ -247,28 +390,164 @@ public class SecretsView extends JPanel {
     private void createTableContextMenu() {
         tableContextMenu = new JPopupMenu();
 
+        // Add a listener that dynamically builds menu items before showing
+        tableContextMenu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
+            @Override public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
+                buildContextMenuItems();
+            }
+            @Override public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) {}
+            @Override public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) {}
+        });
+    }
+
+    /**
+     * Build context menu items dynamically based on selected findings' state.
+     */
+    private void buildContextMenuItems() {
+        tableContextMenu.removeAll();
+
+        int[] selectedRows = secretsTable.getSelectedRows();
+        if (selectedRows.length == 0) return;
+
+        // Determine aggregate state of selected findings
+        boolean anyNotValidated = false;
+        boolean anyValidated = false;
+        boolean anyFP = false;
+        boolean anyNotFP = false;
+        for (int row : selectedRows) {
+            int modelRow = secretsTable.convertRowIndexToModel(row);
+            DedupCache.FindingRecord record = tableModel.getRecordAt(modelRow);
+            if (record == null) continue;
+            if (record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
+                anyFP = true;
+            } else {
+                anyNotFP = true;
+            }
+            if (record.validatedAt != null) {
+                anyValidated = true;
+            } else {
+                anyNotValidated = true;
+            }
+        }
+
+        // Copy actions — always available
         JMenuItem copySecretItem = new JMenuItem("Copy Secret");
         copySecretItem.addActionListener(e -> copySelectedSecret());
+        tableContextMenu.add(copySecretItem);
 
         JMenuItem copyPreviewItem = new JMenuItem("Copy Preview");
         copyPreviewItem.addActionListener(e -> copySelectedPreview());
-
-        JMenuItem validateItem = new JMenuItem("Validate");
-        validateItem.addActionListener(e -> validateSelected());
-
-        JMenuItem markFPItem = new JMenuItem("Mark as False Positive");
-        markFPItem.addActionListener(e -> markFalsePositive());
-
-        JMenuItem unmarkFPItem = new JMenuItem("Unmark False Positive");
-        unmarkFPItem.addActionListener(e -> unmarkFalsePositive());
-
-        tableContextMenu.add(copySecretItem);
         tableContextMenu.add(copyPreviewItem);
+
         tableContextMenu.addSeparator();
-        tableContextMenu.add(validateItem);
+
+        // Validate / Revalidate — show based on validation state
+        if (anyNotValidated && !anyValidated) {
+            JMenuItem validateItem = new JMenuItem("Validate");
+            validateItem.addActionListener(e -> validateSelected());
+            tableContextMenu.add(validateItem);
+        } else if (anyValidated && !anyNotValidated) {
+            JMenuItem revalidateItem = new JMenuItem("Revalidate");
+            revalidateItem.addActionListener(e -> validateSelected());
+            tableContextMenu.add(revalidateItem);
+        } else {
+            // Mixed selection
+            JMenuItem validateItem = new JMenuItem("Validate / Revalidate");
+            validateItem.addActionListener(e -> validateSelected());
+            tableContextMenu.add(validateItem);
+        }
+
         tableContextMenu.addSeparator();
-        tableContextMenu.add(markFPItem);
-        tableContextMenu.add(unmarkFPItem);
+
+        // Change Severity — always available
+        JMenu changeSeverityMenu = new JMenu("Change Severity");
+        for (var sev : new String[]{"High", "Medium", "Low", "Info"}) {
+            JMenuItem item = new JMenuItem(sev);
+            item.addActionListener(e -> changeSeverityOfSelected(sev));
+            changeSeverityMenu.add(item);
+        }
+        changeSeverityMenu.addSeparator();
+        JMenuItem resetSevItem = new JMenuItem("Reset to Default");
+        resetSevItem.addActionListener(e -> changeSeverityOfSelected(null));
+        changeSeverityMenu.add(resetSevItem);
+        tableContextMenu.add(changeSeverityMenu);
+
+        tableContextMenu.addSeparator();
+
+        // FP actions — show only relevant option(s)
+        if (anyNotFP) {
+            JMenuItem markFPItem = new JMenuItem("Mark as False Positive");
+            markFPItem.addActionListener(e -> markFalsePositive());
+            tableContextMenu.add(markFPItem);
+        }
+        if (anyFP) {
+            JMenuItem unmarkFPItem = new JMenuItem("Unmark False Positive");
+            unmarkFPItem.addActionListener(e -> unmarkFalsePositive());
+            tableContextMenu.add(unmarkFPItem);
+        }
+
+        tableContextMenu.addSeparator();
+
+        // Delete action
+        String deleteLabel = selectedRows.length == 1 ? "Delete Finding" : "Delete " + selectedRows.length + " Findings";
+        JMenuItem deleteItem = new JMenuItem(deleteLabel);
+        deleteItem.setForeground(new Color(200, 50, 50));
+        deleteItem.addActionListener(e -> deleteSelected());
+        tableContextMenu.add(deleteItem);
+    }
+
+    private void deleteSelected() {
+        int[] selectedRows = secretsTable.getSelectedRows();
+        if (selectedRows.length == 0) return;
+
+        // Collect records to delete
+        java.util.List<DedupCache.FindingRecord> toDelete = new java.util.ArrayList<>();
+        for (int row : selectedRows) {
+            int modelRow = secretsTable.convertRowIndexToModel(row);
+            DedupCache.FindingRecord record = tableModel.getRecordAt(modelRow);
+            if (record != null) {
+                toDelete.add(record);
+            }
+        }
+
+        if (toDelete.isEmpty()) return;
+
+        // Confirmation dialog
+        String message;
+        if (toDelete.size() == 1) {
+            DedupCache.FindingRecord r = toDelete.get(0);
+            String type = r.ruleName != null ? r.ruleName : r.ruleId;
+            String preview = r.secretPreview != null && r.secretPreview.length() > 40
+                ? r.secretPreview.substring(0, 40) + "..."
+                : r.secretPreview;
+            message = "Permanently delete this finding?\n\n"
+                + "Type: " + type + "\n"
+                + "Secret: " + preview + "\n\n"
+                + "This cannot be undone. The secret will be re-detected\n"
+                + "if the same traffic is scanned again.";
+        } else {
+            message = "Permanently delete " + toDelete.size() + " findings?\n\n"
+                + "This cannot be undone. Deleted secrets will be re-detected\n"
+                + "if the same traffic is scanned again.";
+        }
+
+        int result = javax.swing.JOptionPane.showConfirmDialog(
+            api.userInterface().swingUtils().suiteFrame(), message, "Delete Finding" + (toDelete.size() > 1 ? "s" : ""),
+            javax.swing.JOptionPane.YES_NO_OPTION,
+            javax.swing.JOptionPane.WARNING_MESSAGE
+        );
+
+        if (result != javax.swing.JOptionPane.YES_OPTION) return;
+
+        int deleted = 0;
+        for (DedupCache.FindingRecord record : toDelete) {
+            if (dedupCache.removeFinding(record)) {
+                deleted++;
+            }
+        }
+
+        refresh();
+        api.logging().logToOutput("Deleted " + deleted + " finding(s)");
     }
 
     private void copySelectedPreview() {
@@ -389,8 +668,14 @@ public class SecretsView extends JPanel {
         statusFilterButton.addActionListener(e -> statusPopup.show(statusFilterButton, 0, statusFilterButton.getHeight()));
         mainPanel.add(statusFilterButton);
 
+        // Columns visibility button
+        JButton columnsButton = new JButton("Columns");
+        columnsButton.setToolTipText("Show/hide table columns");
+        columnsButton.addActionListener(e -> showColumnsPopup(columnsButton));
+        mainPanel.add(columnsButton);
+
         // Clear button
-        JButton clearButton = new JButton("Clear All");
+        JButton clearButton = new JButton("Clear Filters");
         clearButton.addActionListener(e -> clearFilters());
         mainPanel.add(clearButton);
 
@@ -485,6 +770,11 @@ public class SecretsView extends JPanel {
         }
         hostCheckboxPanel.revalidate();
         hostCheckboxPanel.repaint();
+
+        // Update button text to reflect current filter state
+        updateFilterButtonText(typeFilterButton, "Type", getSelectedItems(typeCheckboxes, typeAllCheckbox));
+        updateFilterButtonText(hostFilterButton, "Host", getSelectedItems(hostCheckboxes, hostAllCheckbox));
+        updateFilterButtonText(statusFilterButton, "Status", getSelectedItems(statusCheckboxes, statusAllCheckbox));
     }
 
     private void applyFilters() {
@@ -591,6 +881,10 @@ public class SecretsView extends JPanel {
         typeFilterButton.setText("Type");
         hostFilterButton.setText("Host");
         statusFilterButton.setText("Status");
+        // Restore all hidden columns
+        for (int colIndex : new ArrayList<>(hiddenColumns)) {
+            toggleColumn(colIndex);
+        }
         applyFilters();
         updateStatus();
     }
@@ -655,7 +949,8 @@ public class SecretsView extends JPanel {
         }
 
         // Enable buttons based on selection
-        boolean anyValidatable = false;
+        boolean anyNotChecked = false;
+        boolean anyValidated = false;
         boolean anyFalsePositive = false;
         boolean anyNotFalsePositive = false;
 
@@ -663,7 +958,12 @@ public class SecretsView extends JPanel {
             DedupCache.FindingRecord record = tableModel.getRecordAt(row);
             if (record != null) {
                 if (record.validationStatus == DedupCache.ValidationStatus.NOT_CHECKED) {
-                    anyValidatable = true;
+                    anyNotChecked = true;
+                }
+                if (record.validatedAt != null || record.validationStatus == DedupCache.ValidationStatus.VALID
+                        || record.validationStatus == DedupCache.ValidationStatus.INVALID
+                        || record.validationStatus == DedupCache.ValidationStatus.UNDETERMINED) {
+                    anyValidated = true;
                 }
                 if (record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
                     anyFalsePositive = true;
@@ -673,7 +973,14 @@ public class SecretsView extends JPanel {
             }
         }
 
-        validateButton.setEnabled(anyValidatable);
+        // Update validate button label and enable state
+        boolean canValidate = anyNotChecked || anyValidated;
+        validateButton.setEnabled(canValidate);
+        if (anyValidated && !anyNotChecked) {
+            validateButton.setText("Revalidate");
+        } else {
+            validateButton.setText("Validate");
+        }
         falsePositiveButton.setEnabled(anyNotFalsePositive);
         unmarkFPButton.setEnabled(anyFalsePositive);
         copyButton.setEnabled(modelRows.length == 1);
@@ -713,7 +1020,7 @@ public class SecretsView extends JPanel {
 
         // === ADVISORY SECTION ===
         // Header with severity indicator and title
-        String severityColor = getSeverityIndicatorColor(record.ruleId);
+        String severityColor = getSeverityIndicatorColor(record);
         String displayName = record.ruleName != null ? record.ruleName : SecretCategoryMapper.getDisplayName(record.ruleId, record.ruleName);
         html.append("<div style='margin-bottom: 8px;'>");
         html.append("<span style='color: ").append(severityColor).append("; font-size: 12px;'>&#9679;</span> ");
@@ -721,7 +1028,7 @@ public class SecretsView extends JPanel {
         html.append("</div>");
 
         // Severity, Confidence, Host
-        String severity = getSeverityName(record.ruleId);
+        String severity = getSeverityName(record);
         html.append("<table cellpadding='1' cellspacing='0' style='margin-bottom: 8px;'>");
         html.append("<tr><td style='color: ").append(theme[1]).append(";'>Severity:</td><td style='padding-left: 8px;'>").append(severity).append("</td></tr>");
         html.append("<tr><td style='color: ").append(theme[1]).append(";'>Confidence:</td><td style='padding-left: 8px;'>Certain</td></tr>");
@@ -742,11 +1049,23 @@ public class SecretsView extends JPanel {
 
         // === SECRET/CONTEXT SECTION ===
         html.append("<div style='margin-bottom: 8px;'>");
-        html.append("<div style='font-weight: bold; margin-bottom: 2px;'>Secret:</div>");
-        String secretValue = record.secretContent != null ? record.secretContent : record.secretPreview;
-        html.append("<div style='font-family: monospace; font-size: 9px; padding: 4px; background: ").append(theme[2]).append("; color: ").append(theme[3]).append("; border-radius: 2px; word-wrap: break-word;'>");
-        html.append(escapeHtml(secretValue));
-        html.append("</div>");
+        java.util.Map<String, String> groups = record.getNamedGroups();
+        if (groups != null && groups.size() > 1) {
+            // Paired secret — show each named group with its label
+            html.append("<div style='font-weight: bold; margin-bottom: 2px;'>Secret (paired):</div>");
+            for (java.util.Map.Entry<String, String> entry : groups.entrySet()) {
+                html.append("<div style='font-family: monospace; font-size: 9px; padding: 2px 4px; margin-bottom: 2px; background: ").append(theme[2]).append("; color: ").append(theme[3]).append("; border-radius: 2px; word-wrap: break-word;'>");
+                html.append("<span style='color: ").append(theme[1]).append(";'>").append(escapeHtml(entry.getKey())).append(":</span> ");
+                html.append(escapeHtml(entry.getValue()));
+                html.append("</div>");
+            }
+        } else {
+            html.append("<div style='font-weight: bold; margin-bottom: 2px;'>Secret:</div>");
+            String secretValue = record.secretContent != null ? record.secretContent : record.secretPreview;
+            html.append("<div style='font-family: monospace; font-size: 9px; padding: 4px; background: ").append(theme[2]).append("; color: ").append(theme[3]).append("; border-radius: 2px; word-wrap: break-word;'>");
+            html.append(escapeHtml(secretValue));
+            html.append("</div>");
+        }
         html.append("</div>");
 
         // === URLs SECTION ===
@@ -877,31 +1196,42 @@ public class SecretsView extends JPanel {
     /**
      * Get severity indicator color for advisory display.
      */
-    private String getSeverityIndicatorColor(String ruleId) {
-        SecretCategoryMapper.Category category = SecretCategoryMapper.getCategory(ruleId);
-        String name = category.name();
-        if (name.equals("CLOUD") || name.equals("DATABASE") || name.equals("AUTH")) {
-            return "#d9534f";  // Red for High
-        } else if (name.equals("SAAS") || name.equals("AI")) {
-            return "#f0ad4e";  // Orange for Medium
-        } else {
-            return "#5bc0de";  // Blue for Low/Info
-        }
+    private String getSeverityIndicatorColor(DedupCache.FindingRecord record) {
+        int modelRow = findings_indexOf(record);
+        burp.api.montoya.scanner.audit.issues.AuditIssueSeverity severity =
+            modelRow >= 0 ? tableModel.getSeverityAt(modelRow) : burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.MEDIUM;
+        return switch (severity) {
+            case HIGH -> "#d9534f";
+            case MEDIUM -> "#f0ad4e";
+            case LOW, INFORMATION -> "#5bc0de";
+            case FALSE_POSITIVE -> "#999999";
+        };
     }
 
     /**
      * Get severity name for advisory display.
      */
-    private String getSeverityName(String ruleId) {
-        SecretCategoryMapper.Category category = SecretCategoryMapper.getCategory(ruleId);
-        String name = category.name();
-        if (name.equals("CLOUD") || name.equals("DATABASE") || name.equals("AUTH")) {
-            return "High";
-        } else if (name.equals("SAAS") || name.equals("AI")) {
-            return "Medium";
-        } else {
-            return "Low";
+    private String getSeverityName(DedupCache.FindingRecord record) {
+        int modelRow = findings_indexOf(record);
+        burp.api.montoya.scanner.audit.issues.AuditIssueSeverity severity =
+            modelRow >= 0 ? tableModel.getSeverityAt(modelRow) : burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.MEDIUM;
+        return switch (severity) {
+            case HIGH -> "High";
+            case MEDIUM -> "Medium";
+            case LOW -> "Low";
+            case INFORMATION -> "Info";
+            case FALSE_POSITIVE -> "FP";
+        };
+    }
+
+    /**
+     * Find model row index for a record.
+     */
+    private int findings_indexOf(DedupCache.FindingRecord record) {
+        for (int i = 0; i < tableModel.getRowCount(); i++) {
+            if (tableModel.getRecordAt(i) == record) return i;
         }
+        return -1;
     }
 
     private void validateSelected() {
@@ -910,12 +1240,35 @@ public class SecretsView extends JPanel {
             return;
         }
 
+        // Collect eligible findings (skip currently validating)
+        List<DedupCache.FindingRecord> toValidate = new ArrayList<>();
+        boolean anyAlreadyValidated = false;
         for (int row : selectedRows) {
             int modelRow = secretsTable.convertRowIndexToModel(row);
             DedupCache.FindingRecord record = tableModel.getRecordAt(modelRow);
-            if (record != null && record.validationStatus == DedupCache.ValidationStatus.NOT_CHECKED) {
-                validationListener.onValidateRequested(record);
+            if (record == null || record.validationStatus == DedupCache.ValidationStatus.VALIDATING) {
+                continue;
             }
+            if (record.validatedAt != null || record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
+                anyAlreadyValidated = true;
+            }
+            toValidate.add(record);
+        }
+
+        if (toValidate.isEmpty()) return;
+
+        // Confirm revalidation
+        if (anyAlreadyValidated) {
+            int result = javax.swing.JOptionPane.showConfirmDialog(api.userInterface().swingUtils().suiteFrame(),
+                "This will re-check the secret and send new requests to the target. Current results may change.",
+                "Revalidate Secret", javax.swing.JOptionPane.OK_CANCEL_OPTION, javax.swing.JOptionPane.QUESTION_MESSAGE);
+            if (result != javax.swing.JOptionPane.OK_OPTION) {
+                return;
+            }
+        }
+
+        for (DedupCache.FindingRecord record : toValidate) {
+            validationListener.onValidateRequested(record);
         }
     }
 
@@ -939,7 +1292,10 @@ public class SecretsView extends JPanel {
                 falsePositiveListener.onFalsePositiveRequested(records);
             } else {
                 for (DedupCache.FindingRecord record : records) {
-                    record.setValidation(DedupCache.ValidationStatus.FALSE_POSITIVE, "Marked by user");
+                    record.preMarkFPStatus = record.validationStatus;
+                    // Set FP status without modifying validatedAt (Checked column)
+                    record.validationStatus = DedupCache.ValidationStatus.FALSE_POSITIVE;
+                    record.validationMessage = "Marked by user";
                 }
                 dedupCache.saveToSettings();
                 refresh();
@@ -957,11 +1313,43 @@ public class SecretsView extends JPanel {
             int modelRow = secretsTable.convertRowIndexToModel(row);
             DedupCache.FindingRecord record = tableModel.getRecordAt(modelRow);
             if (record != null && record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
-                record.setValidation(DedupCache.ValidationStatus.NOT_CHECKED, null);
+                // Restore previous status without modifying validatedAt (Checked column)
+                record.validationStatus = record.preMarkFPStatus != null
+                    ? record.preMarkFPStatus : DedupCache.ValidationStatus.NOT_CHECKED;
+                record.preMarkFPStatus = null;
             }
         }
         dedupCache.saveToSettings();
         refresh();
+    }
+
+    private void changeSeverityOfSelected(String severityLabel) {
+        int[] selectedRows = secretsTable.getSelectedRows();
+        if (selectedRows.length == 0) return;
+
+        String override = severityLabel != null ? switch (severityLabel) {
+            case "High" -> "HIGH";
+            case "Medium" -> "MEDIUM";
+            case "Low" -> "LOW";
+            case "Info" -> "INFORMATION";
+            default -> null;
+        } : null;
+
+        for (int row : selectedRows) {
+            int modelRow = secretsTable.convertRowIndexToModel(row);
+            DedupCache.FindingRecord record = tableModel.getRecordAt(modelRow);
+            if (record != null) {
+                record.severityOverride = override;
+            }
+        }
+        dedupCache.saveToSettings();
+        refresh();
+    }
+
+    private void selectAll() {
+        if (secretsTable.getRowCount() > 0) {
+            secretsTable.setRowSelectionInterval(0, secretsTable.getRowCount() - 1);
+        }
     }
 
     private void copySelectedSecret() {
@@ -1047,6 +1435,16 @@ public class SecretsView extends JPanel {
     }
 
     /**
+     * Show a temporary status message that reverts to normal after 5 seconds.
+     */
+    public void showTemporaryStatus(String message) {
+        statusLabel.setText(message);
+        javax.swing.Timer timer = new javax.swing.Timer(5000, e -> updateStatus());
+        timer.setRepeats(false);
+        timer.start();
+    }
+
+    /**
      * Set the validation listener.
      */
     public void setValidationListener(ValidationListener listener) {
@@ -1100,10 +1498,18 @@ public class SecretsView extends JPanel {
         // Dark theme: muted darker tones
         private static final Color HIGH_COLOR_DARK = new Color(140, 70, 70);
         private static final Color MEDIUM_COLOR_DARK = new Color(140, 130, 60);
+        private static final Color LOW_COLOR_DARK = new Color(120, 140, 165);
 
         // Light theme: soft pastel tones
         private static final Color HIGH_COLOR_LIGHT = new Color(255, 200, 200);
         private static final Color MEDIUM_COLOR_LIGHT = new Color(255, 243, 200);
+        private static final Color LOW_COLOR_LIGHT = new Color(235, 242, 255);
+
+        // Validation state colors
+        private static final Color VALID_BG_DARK = new Color(50, 100, 50);
+        private static final Color VALID_BG_LIGHT = new Color(210, 245, 210);
+        private static final Color DIMMED_FG_DARK = new Color(120, 120, 120);
+        private static final Color DIMMED_FG_LIGHT = new Color(170, 170, 170);
 
         @Override
         public Component getTableCellRendererComponent(JTable table, Object value,
@@ -1115,30 +1521,45 @@ public class SecretsView extends JPanel {
                 // Convert view row to model row for correct severity lookup
                 int modelRow = table.convertRowIndexToModel(row);
                 burp.api.montoya.scanner.audit.issues.AuditIssueSeverity severity = tableModel.getSeverityAt(modelRow);
+                DedupCache.FindingRecord record = tableModel.getRecordAt(modelRow);
+                DedupCache.ValidationStatus valStatus = record != null ? record.validationStatus : null;
 
                 boolean dark = isDarkTheme();
-                Color bgColor = getSeverityColor(severity, dark);
-                if (bgColor != null) {
-                    c.setBackground(bgColor);
-                    // Dark backgrounds need white text; light backgrounds need dark text
-                    c.setForeground(dark ? Color.WHITE : Color.BLACK);
+
+                // Determine background: validation state takes priority over severity
+                Color bgColor;
+                Color fgColor;
+
+                if (valStatus == DedupCache.ValidationStatus.VALID) {
+                    // Valid/Active: subtle green background
+                    bgColor = dark ? VALID_BG_DARK : VALID_BG_LIGHT;
+                    fgColor = dark ? Color.WHITE : Color.BLACK;
+                } else if (valStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
+                    // Manually marked FP: dimmed text, default background
+                    bgColor = UIManager.getColor("Table.background");
+                    if (bgColor == null) bgColor = dark ? Color.DARK_GRAY : Color.WHITE;
+                    fgColor = dark ? DIMMED_FG_DARK : DIMMED_FG_LIGHT;
                 } else {
-                    // Use UIManager's default colors for consistent appearance
-                    Color defaultBg = UIManager.getColor("Table.background");
-                    if (defaultBg == null) {
-                        defaultBg = Color.WHITE;
+                    // Normal: use severity color
+                    bgColor = getSeverityColor(severity, dark);
+                    if (bgColor != null) {
+                        fgColor = dark ? Color.WHITE : Color.BLACK;
+                    } else {
+                        bgColor = UIManager.getColor("Table.background");
+                        if (bgColor == null) bgColor = dark ? Color.DARK_GRAY : Color.WHITE;
+                        fgColor = UIManager.getColor("Table.foreground");
+                        if (fgColor == null) fgColor = dark ? Color.WHITE : Color.BLACK;
                     }
-                    c.setBackground(defaultBg);
-                    Color defaultFg = UIManager.getColor("Table.foreground");
-                    if (defaultFg == null) {
-                        defaultFg = Color.BLACK;
-                    }
-                    c.setForeground(defaultFg);
                 }
+
+                c.setBackground(bgColor);
+                c.setForeground(fgColor);
             }
 
             // Center align small columns: #, Severity, Count, Checked, Result, False Positive
-            if (column == 0 || column == 2 || column == 6 || column == 7 || column == 8 || column == 9) {
+            // Use model column index since view columns may shift when columns are hidden
+            int modelCol = table.convertColumnIndexToModel(column);
+            if (modelCol == 0 || modelCol == 2 || modelCol == 6 || modelCol == 7 || modelCol == 8 || modelCol == 9) {
                 setHorizontalAlignment(JLabel.CENTER);
             } else {
                 setHorizontalAlignment(JLabel.LEFT);
@@ -1148,13 +1569,14 @@ public class SecretsView extends JPanel {
         }
 
         /**
-         * Get color for severity, adapted to current theme. Returns null for Low/Info/FP (use default).
+         * Get color for severity, adapted to current theme. Returns null for Info/FP (use default).
          */
         private Color getSeverityColor(burp.api.montoya.scanner.audit.issues.AuditIssueSeverity severity, boolean dark) {
             return switch (severity) {
                 case HIGH -> dark ? HIGH_COLOR_DARK : HIGH_COLOR_LIGHT;
                 case MEDIUM -> dark ? MEDIUM_COLOR_DARK : MEDIUM_COLOR_LIGHT;
-                case LOW, INFORMATION, FALSE_POSITIVE -> null;
+                case LOW -> dark ? LOW_COLOR_DARK : LOW_COLOR_LIGHT;
+                case INFORMATION, FALSE_POSITIVE -> null;
             };
         }
     }

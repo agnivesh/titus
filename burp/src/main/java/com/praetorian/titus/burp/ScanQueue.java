@@ -59,6 +59,22 @@ public class ScanQueue implements AutoCloseable {
          * @param category  The primary category of secrets found
          */
         default void onSecretsFound(String url, int count, String types, SecretCategoryMapper.Category category) {}
+
+        /**
+         * Called when a batch of jobs has been scanned (whether or not secrets were found).
+         * This is called on the worker thread - use SwingUtilities.invokeLater for UI updates.
+         *
+         * @param jobCount      Number of jobs in the batch
+         * @param secretsFound  Total new unique secrets found in this batch
+         * @param source        The scan source (PASSIVE or ACTIVE)
+         */
+        default void onScanComplete(int jobCount, int secretsFound, ScanJob.Source source) {}
+
+        /**
+         * Called for each URL after it has been scanned, with the number of new secrets found.
+         * Useful for annotating individual requests.
+         */
+        default void onUrlScanned(String url, int secretsFound, ScanJob.Source source) {}
     }
 
     /**
@@ -216,12 +232,20 @@ public class ScanQueue implements AutoCloseable {
 
                 totalScanned.addAndGet(batch.size());
 
+                int batchSecretsFound = 0;
+
                 // Process matches for each job
                 for (ScanJob job : batch) {
                     String url = job.url();
+                    dedupCache.markUrlScanned(url);
                     java.util.List<TitusProcessScanner.Match> matches = matchesBySource.get(url);
 
                     if (matches == null || matches.isEmpty()) {
+                        // Notify that URL was scanned but nothing found
+                        ScanQueueListener l = listener;
+                        if (l != null) {
+                            l.onUrlScanned(url, 0, job.source());
+                        }
                         continue;
                     }
 
@@ -237,9 +261,12 @@ public class ScanQueue implements AutoCloseable {
                     SecretCategoryMapper.Category primaryCategory = null;
 
                     for (TitusProcessScanner.Match match : matches) {
-                        // Check dedup
-                        if (!dedupCache.isNewFinding(url, match.matchedContent(), match.ruleId())) {
-                            log("Worker " + id + " skipping duplicate: " + match.ruleId());
+                        // Atomic check-and-record: eliminates TOCTOU race between isNewFinding/recordOccurrence
+                        boolean isNew = dedupCache.recordIfNew(url, match.matchedContent(), match.ruleId(), match.ruleName(),
+                                                              requestContent, responseContent, match.namedGroups());
+
+                        if (!isNew) {
+                            log("Worker " + id + " duplicate at new URL: " + match.ruleId());
                             continue;
                         }
 
@@ -254,11 +281,10 @@ public class ScanQueue implements AutoCloseable {
                             primaryCategory = category;
                         }
 
-                        // Record and report with HTTP content and named groups
-                        dedupCache.recordOccurrence(url, match.matchedContent(), match.ruleId(), match.ruleName(),
-                                                   requestContent, responseContent, match.namedGroups());
                         issueReporter.reportIssue(job, match);
                     }
+
+                    batchSecretsFound += secretCount;
 
                     // Notify listener of secrets found (for UI update)
                     if (secretCount > 0) {
@@ -268,11 +294,34 @@ public class ScanQueue implements AutoCloseable {
                             l.onSecretsFound(url, secretCount, types, primaryCategory);
                         }
                     }
+
+                    // Notify per-URL scan result (for annotations)
+                    {
+                        ScanQueueListener l = listener;
+                        if (l != null) {
+                            l.onUrlScanned(url, secretCount, job.source());
+                        }
+                    }
+                }
+
+                // Notify listener that batch is complete
+                ScanQueueListener l = listener;
+                if (l != null) {
+                    // Use the source from the first job in the batch
+                    ScanJob.Source source = batch.get(0).source();
+                    l.onScanComplete(batch.size(), batchSecretsFound, source);
                 }
 
             } catch (IOException e) {
                 logError("Worker " + id + " batch scan error: " + e.getMessage());
                 e.printStackTrace();
+                // Ensure per-URL callbacks fire even on error, to prevent pendingAnnotations leaks
+                ScanQueueListener l = listener;
+                if (l != null) {
+                    for (ScanJob job : batch) {
+                        l.onUrlScanned(job.url(), 0, job.source());
+                    }
+                }
             }
         }
 

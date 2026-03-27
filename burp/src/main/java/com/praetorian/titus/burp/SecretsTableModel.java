@@ -70,32 +70,63 @@ public class SecretsTableModel extends AbstractTableModel {
         return switch (column) {
             case 0 -> row + 1;
             case 1 -> record.ruleName != null ? record.ruleName : SecretCategoryMapper.getDisplayName(record.ruleId, null);
-            case 2 -> getSeverityDisplay(record.ruleId);  // Severity column
-            case 3 -> record.secretPreview;
+            case 2 -> getSeverityDisplay(record);  // Severity column
+            case 3 -> getSecretPreview(record);
             case 4 -> record.primaryHost != null ? record.primaryHost : "unknown";
             case 5 -> extractPath(record);  // Path column
-            case 6 -> record.occurrenceCount;
+            case 6 -> record.urls != null ? record.urls.size() : record.occurrenceCount;
             case 7 -> // Checked column - was validation attempted?
                 record.validatedAt != null ? "Yes" : "No";
             case 8 -> {
-                // Result column - show validation result
-                if (record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
+                // Result column - show validation result (preserved even when marked FP)
+                DedupCache.ValidationStatus effectiveStatus = record.validationStatus;
+                if (effectiveStatus == DedupCache.ValidationStatus.FALSE_POSITIVE) {
+                    effectiveStatus = record.preMarkFPStatus;
+                }
+                if (effectiveStatus == null || effectiveStatus == DedupCache.ValidationStatus.NOT_CHECKED) {
                     yield "-";
                 }
-                if (record.validatedAt == null) {
-                    yield "-";
-                }
-                yield switch (record.validationStatus) {
+                yield switch (effectiveStatus) {
                     case VALID -> "Active";
                     case INVALID -> "Inactive";
                     case UNDETERMINED -> "Unknown";
                     case VALIDATING -> "...";
-                    default -> "Unknown"; // Should not happen if validatedAt is set
+                    default -> "-";
                 };
             }
             case 9 -> record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE ? "Yes" : "No";
             default -> null;
         };
+    }
+
+    /**
+     * Get the secret preview, showing paired values for multi-group findings.
+     * Returns the full content so wider columns show more text.
+     */
+    private static final int MAX_PREVIEW_LENGTH = 120;
+
+    private String getSecretPreview(DedupCache.FindingRecord record) {
+        String preview;
+
+        // For findings with multiple named groups, show paired values
+        Map<String, String> groups = record.getNamedGroups();
+        if (groups != null && groups.size() > 1) {
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> entry : groups.entrySet()) {
+                if (sb.length() > 0) sb.append(" : ");
+                sb.append(entry.getValue());
+            }
+            preview = sb.toString();
+        } else if (record.secretContent != null && !record.secretContent.isEmpty()) {
+            preview = record.secretContent;
+        } else {
+            return record.secretPreview != null ? record.secretPreview : "[empty]";
+        }
+
+        if (preview.length() > MAX_PREVIEW_LENGTH) {
+            return preview.substring(0, MAX_PREVIEW_LENGTH) + "...";
+        }
+        return preview;
     }
 
     /**
@@ -106,8 +137,16 @@ public class SecretsTableModel extends AbstractTableModel {
             return "/";
         }
         String url = record.urls.iterator().next();
+        String path = extractPathFromUrl(url);
+        int urlCount = record.urls.size();
+        if (urlCount > 1) {
+            return path + " (+" + (urlCount - 1) + " more)";
+        }
+        return path;
+    }
+
+    private String extractPathFromUrl(String url) {
         try {
-            // Extract path from URL
             int schemeEnd = url.indexOf("://");
             if (schemeEnd > 0) {
                 int pathStart = url.indexOf('/', schemeEnd + 3);
@@ -126,13 +165,25 @@ public class SecretsTableModel extends AbstractTableModel {
     }
 
     /**
-     * Get severity display text for a rule ID.
+     * Get effective severity for a finding, checking per-finding override first.
      */
-    private String getSeverityDisplay(String ruleId) {
-        if (severityConfig == null) {
-            return "Medium";
+    private AuditIssueSeverity getEffectiveSeverity(DedupCache.FindingRecord record) {
+        if (record.severityOverride != null) {
+            try {
+                return AuditIssueSeverity.valueOf(record.severityOverride);
+            } catch (IllegalArgumentException ignored) {}
         }
-        AuditIssueSeverity severity = severityConfig.getSeverity(ruleId);
+        if (severityConfig == null) {
+            return AuditIssueSeverity.MEDIUM;
+        }
+        return severityConfig.getSeverity(record.ruleId);
+    }
+
+    /**
+     * Get severity display text for a finding.
+     */
+    private String getSeverityDisplay(DedupCache.FindingRecord record) {
+        AuditIssueSeverity severity = getEffectiveSeverity(record);
         return switch (severity) {
             case HIGH -> "High";
             case MEDIUM -> "Medium";
@@ -143,13 +194,13 @@ public class SecretsTableModel extends AbstractTableModel {
     }
 
     /**
-     * Get severity for a rule ID.
+     * Get severity at a row.
      */
     public AuditIssueSeverity getSeverityAt(int row) {
-        if (row < 0 || row >= findings.size() || severityConfig == null) {
+        if (row < 0 || row >= findings.size()) {
             return AuditIssueSeverity.MEDIUM;
         }
-        return severityConfig.getSeverity(findings.get(row).ruleId);
+        return getEffectiveSeverity(findings.get(row));
     }
 
     /**

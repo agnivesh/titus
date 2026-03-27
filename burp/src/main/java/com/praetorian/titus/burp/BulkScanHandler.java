@@ -76,8 +76,8 @@ public class BulkScanHandler {
                     String contentHash = hashContent(item.response().body().toString());
                     String url = item.request().url();
 
-                    // Use dedup cache to check if already processed
-                    if (dedupCache.hasProcessedUrl(url, contentHash)) {
+                    // Atomic check-and-mark to avoid TOCTOU race on double bulk scan
+                    if (!dedupCache.markUrlProcessedIfNew(url, contentHash)) {
                         alreadyScanned++;
                         continue;
                     }
@@ -92,7 +92,6 @@ public class BulkScanHandler {
 
                     if (scanQueue.enqueue(job)) {
                         queued++;
-                        dedupCache.markUrlProcessed(url, contentHash);
                     } else {
                         skipped++;
                     }
@@ -127,7 +126,7 @@ public class BulkScanHandler {
                     api.logging().logToOutput(message);
 
                     JOptionPane.showMessageDialog(
-                        null,
+                        api.userInterface().swingUtils().suiteFrame(),
                         message,
                         "Bulk Scan Complete",
                         JOptionPane.INFORMATION_MESSAGE
@@ -135,7 +134,7 @@ public class BulkScanHandler {
                 } catch (Exception e) {
                     api.logging().logToError("Bulk scan failed: " + e.getMessage());
                     JOptionPane.showMessageDialog(
-                        null,
+                        api.userInterface().swingUtils().suiteFrame(),
                         "Bulk scan failed: " + e.getMessage(),
                         "Bulk Scan Error",
                         JOptionPane.ERROR_MESSAGE

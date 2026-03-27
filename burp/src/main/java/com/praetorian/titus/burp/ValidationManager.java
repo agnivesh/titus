@@ -9,6 +9,8 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
 /**
@@ -25,6 +27,8 @@ public class ValidationManager {
 
     private volatile boolean validationEnabled = false;
     private final Map<String, DedupCache.ValidationStatus> validationCache = new ConcurrentHashMap<>();
+    private final ExecutorService validationExecutor = Executors.newFixedThreadPool(2,
+        r -> { Thread t = new Thread(r, "titus-validator"); t.setDaemon(true); return t; });
 
     public ValidationManager(MontoyaApi api, ProcessManager processManager, DedupCache dedupCache) {
         this.api = api;
@@ -66,13 +70,19 @@ public class ValidationManager {
             return;
         }
 
-        // Check cache
+        // Remember if finding was marked as FP — preserve across revalidation
+        boolean wasFP = record.validationStatus == DedupCache.ValidationStatus.FALSE_POSITIVE;
+        boolean isRevalidation = record.validatedAt != null || wasFP;
+
+        // Check cache (skip for revalidation)
         String cacheKey = record.ruleId + ":" + record.secretContent;
-        DedupCache.ValidationStatus cached = validationCache.get(cacheKey);
-        if (cached != null && cached != DedupCache.ValidationStatus.NOT_CHECKED) {
-            record.validationStatus = cached;
-            SwingUtilities.invokeLater(() -> callback.accept(record));
-            return;
+        if (!isRevalidation) {
+            DedupCache.ValidationStatus cached = validationCache.get(cacheKey);
+            if (cached != null && cached != DedupCache.ValidationStatus.NOT_CHECKED) {
+                record.validationStatus = cached;
+                SwingUtilities.invokeLater(() -> callback.accept(record));
+                return;
+            }
         }
 
         // Mark as validating
@@ -80,7 +90,7 @@ public class ValidationManager {
         SwingUtilities.invokeLater(() -> callback.accept(record));
 
         // Perform validation in background
-        new Thread(() -> {
+        validationExecutor.submit(() -> {
             try {
                 ValidationResult result = validate(record.ruleId, record.secretContent, record.getNamedGroups());
 
@@ -90,7 +100,13 @@ public class ValidationManager {
                     default -> DedupCache.ValidationStatus.UNDETERMINED;
                 };
 
-                record.setValidation(status, result.message());
+                // If it was FP, keep the FP flag but update the underlying result
+                if (wasFP) {
+                    record.preMarkFPStatus = status;
+                    record.setValidation(DedupCache.ValidationStatus.FALSE_POSITIVE, result.message());
+                } else {
+                    record.setValidation(status, result.message());
+                }
                 record.setValidationDetails(result.details());
                 validationCache.put(cacheKey, status);
                 dedupCache.saveToSettings(); // Persist
@@ -99,10 +115,15 @@ public class ValidationManager {
 
             } catch (Exception e) {
                 api.logging().logToError("Validation failed: " + e.getMessage());
-                record.setValidation(DedupCache.ValidationStatus.UNDETERMINED, "Error: " + e.getMessage());
+                if (wasFP) {
+                    record.preMarkFPStatus = DedupCache.ValidationStatus.UNDETERMINED;
+                    record.setValidation(DedupCache.ValidationStatus.FALSE_POSITIVE, "Error: " + e.getMessage());
+                } else {
+                    record.setValidation(DedupCache.ValidationStatus.UNDETERMINED, "Error: " + e.getMessage());
+                }
                 SwingUtilities.invokeLater(() -> callback.accept(record));
             }
-        }, "titus-validator").start();
+        });
     }
 
     /**
@@ -176,6 +197,13 @@ public class ValidationManager {
         } catch (Exception e) {
             api.logging().logToError("Failed to save validation settings: " + e.getMessage());
         }
+    }
+
+    /**
+     * Shut down the validation executor on extension unload.
+     */
+    public void close() {
+        validationExecutor.shutdownNow();
     }
 
     /**

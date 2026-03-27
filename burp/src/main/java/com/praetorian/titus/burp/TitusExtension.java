@@ -10,6 +10,9 @@ import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import java.awt.Component;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.swing.JMenuItem;
 
 /**
@@ -30,6 +33,7 @@ public class TitusExtension implements BurpExtension {
     private SettingsTab settingsTab;
     private BulkScanHandler bulkScanHandler;
     private ValidationManager validationManager;
+    private final AtomicBoolean initialized = new AtomicBoolean(false);
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -43,8 +47,6 @@ public class TitusExtension implements BurpExtension {
             api.logging().logToOutput("Found titus binary at: " + titusPath);
 
             this.processManager = new ProcessManager(api, titusPath);
-            this.processManager.initialize();
-
             this.severityConfig = new SeverityConfig(api);
             this.dedupCache = new DedupCache(api);
             this.issueReporter = new IssueReporter(api, severityConfig);
@@ -67,18 +69,31 @@ public class TitusExtension implements BurpExtension {
             this.validationManager = new ValidationManager(api, processManager, dedupCache);
             this.settingsTab.setValidationManager(validationManager);
 
+            // Wire annotation callback for active scan results
+            this.settingsTab.setAnnotationCallback(this::annotateScannedItems);
+
             // Initialize bulk scan handler
             this.bulkScanHandler = new BulkScanHandler(api, scanQueue, fastPathFilter, dedupCache, settingsTab);
 
-            // Custom response editor disabled - using Secrets tab instead
-            // api.userInterface().registerHttpResponseEditorProvider(
-            //     new SecretEditorProvider(api, processManager, dedupCache)
-            // );
+            // Titus sub-tab in response editors (Proxy, Repeater) - shows inline secret findings
+            api.userInterface().registerHttpResponseEditorProvider(
+                new SecretEditorProvider(api, processManager, dedupCache)
+            );
 
-            api.logging().logToOutput("Titus Secret Scanner initialized successfully");
-            api.logging().logToOutput("  - Titus version: " + processManager.getScanner().getVersion());
-            api.logging().logToOutput("  - Passive scanning: ENABLED");
-            api.logging().logToOutput("  - Active scanning: Right-click context menu");
+            // Initialize the titus subprocess off-EDT to avoid blocking the UI
+            CompletableFuture.runAsync(() -> {
+                try {
+                    processManager.initialize();
+                    initialized.set(true);
+                    api.logging().logToOutput("Titus Secret Scanner initialized successfully");
+                    api.logging().logToOutput("  - Titus version: " + processManager.getScanner().getVersion());
+                    api.logging().logToOutput("  - Passive scanning: ENABLED");
+                    api.logging().logToOutput("  - Active scanning: Right-click context menu");
+                } catch (Exception e) {
+                    api.logging().logToError("Failed to initialize Titus process: " + e.getMessage());
+                    e.printStackTrace();
+                }
+            });
 
         } catch (Exception e) {
             api.logging().logToError("Failed to initialize Titus: " + e.getMessage());
@@ -90,7 +105,9 @@ public class TitusExtension implements BurpExtension {
             // Save messages before unload
             if (settingsTab != null) {
                 settingsTab.saveMessages();
+                settingsTab.close();
             }
+            if (validationManager != null) validationManager.close();
             if (scanQueue != null) scanQueue.close();
             if (processManager != null) processManager.close();
         });
@@ -167,6 +184,11 @@ public class TitusExtension implements BurpExtension {
                 return ResponseReceivedAction.continueWith(response);
             }
 
+            // Scope filter: skip out-of-scope traffic when enabled
+            if (settingsTab.isScopeOnlyEnabled() && !api.scope().isInScope(response.initiatingRequest().url())) {
+                return ResponseReceivedAction.continueWith(response);
+            }
+
             // Fast-path filter: skip non-scannable content
             if (!fastPathFilter.shouldScan(response)) {
                 return ResponseReceivedAction.continueWith(response);
@@ -192,6 +214,9 @@ public class TitusExtension implements BurpExtension {
     /**
      * Context menu provider for active scanning of selected items.
      */
+    // Track items from active scans for annotation after completion
+    private final java.util.Map<String, HttpRequestResponse> pendingAnnotations = new ConcurrentHashMap<>();
+
     private class TitusContextMenuProvider implements ContextMenuItemsProvider {
 
         @Override
@@ -230,19 +255,56 @@ public class TitusExtension implements BurpExtension {
                 }
 
                 try {
-                    scanQueue.enqueue(new ScanJob(
+                    String url = item.request().url();
+                    boolean enqueued = scanQueue.enqueue(new ScanJob(
                         item.request(),
                         item.response(),
                         ScanJob.Source.ACTIVE,
                         scanRequest
                     ));
-                    queued++;
+                    if (enqueued) {
+                        pendingAnnotations.put(url, item);
+                        queued++;
+                    }
                 } catch (Exception e) {
                     api.logging().logToError("Failed to queue item for scanning: " + e.getMessage());
                 }
             }
 
+            if (queued > 0) {
+                String msg = "Scanning " + queued + " request" + (queued > 1 ? "s" : "") + " with Titus.\n\n"
+                    + "Results will be written to the Notes field of each request.\n"
+                    + "If secrets are found, they will also appear in the Titus response\n"
+                    + "tab and the Titus extension tab.";
+                javax.swing.JOptionPane.showMessageDialog(
+                    api.userInterface().swingUtils().suiteFrame(), msg, "Titus Scan", javax.swing.JOptionPane.INFORMATION_MESSAGE);
+            }
+
             api.logging().logToOutput("Queued " + queued + " items for Titus scanning");
+        }
+    }
+
+    /**
+     * Annotate actively-scanned items with scan results.
+     * Called from the ScanQueueListener after a batch completes.
+     */
+    void annotateScannedItems(String url, int newSecretsFound) {
+        HttpRequestResponse item = pendingAnnotations.remove(url);
+        if (item != null) {
+            try {
+                // Check total findings for this URL (includes previously found secrets)
+                int totalFindings = dedupCache.getFindingsForUrl(url).size();
+                String note;
+                if (totalFindings > 0) {
+                    note = "Titus: " + totalFindings + " secret" + (totalFindings > 1 ? "s" : "") + " found";
+                } else {
+                    note = "Titus: No secrets found";
+                }
+                item.annotations().setNotes(note);
+            } catch (Exception e) {
+                // Annotations may not be supported for all request types
+                api.logging().logToError("Failed to annotate request: " + e.getMessage());
+            }
         }
     }
 }
