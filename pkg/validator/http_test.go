@@ -542,7 +542,7 @@ func TestHTTPValidator_Validate_SuccessBodyContains_Valid(t *testing.T) {
 	// Slack-style API: returns 200 with ok:true/false in body
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":true,"team":"T123"}`))
+		_, _ = w.Write([]byte(`{"ok":true,"team":"T123"}`))
 	}))
 	defer server.Close()
 
@@ -579,7 +579,7 @@ func TestHTTPValidator_Validate_SuccessBodyContains_Invalid(t *testing.T) {
 	// Slack-style API: returns 200 with ok:false for invalid tokens
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
 	}))
 	defer server.Close()
 
@@ -616,7 +616,7 @@ func TestHTTPValidator_Validate_FailureBodyContains(t *testing.T) {
 	// API that returns 200 but with error in body
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"error","message":"unauthorized"}`))
+		_, _ = w.Write([]byte(`{"status":"error","message":"unauthorized"}`))
 	}))
 	defer server.Close()
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/praetorian-inc/titus/pkg/types"
@@ -66,9 +67,12 @@ func TestCloneEnumerator_LocalRepo(t *testing.T) {
 	}
 	e := NewCloneEnumerator(repos, Config{MaxFileSize: 10 * 1024 * 1024})
 
+	var mu sync.Mutex
 	var blobs []string
 	var provenances []types.Provenance
 	err := e.Enumerate(context.Background(), func(content []byte, blobID types.BlobID, prov types.Provenance) error {
+		mu.Lock()
+		defer mu.Unlock()
 		blobs = append(blobs, string(content))
 		provenances = append(provenances, prov)
 		return nil
@@ -113,8 +117,11 @@ func TestCloneEnumerator_GitMode(t *testing.T) {
 	e := NewCloneEnumerator(repos, Config{MaxFileSize: 10 * 1024 * 1024})
 	e.Git = true
 
+	var mu sync.Mutex
 	var blobs []string
 	err := e.Enumerate(context.Background(), func(content []byte, blobID types.BlobID, prov types.Provenance) error {
+		mu.Lock()
+		defer mu.Unlock()
 		blobs = append(blobs, string(content))
 		// In git mode, provenance should be GitProvenance
 		gp, ok := prov.(types.GitProvenance)
