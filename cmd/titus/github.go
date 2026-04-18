@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/praetorian-inc/titus/pkg/enum"
 	"github.com/praetorian-inc/titus/pkg/matcher"
@@ -14,21 +15,40 @@ import (
 
 var (
 	githubToken        string
+	githubBaseURL      string
 	githubOrg          string
 	githubUser         string
 	githubOutputPath   string
 	githubOutputFormat string
 	githubNoClone      bool
 	githubGit          bool
+	githubSkipForks    bool
+	githubRateLimit    float64
 )
 
 var githubCmd = &cobra.Command{
 	Use:   "github [owner/repo]",
-	Short: "Scan GitHub repositories",
+	Short: "Scan GitHub repositories for secrets",
 	Long: `Scan GitHub repositories by cloning and scanning locally.
-No API token needed for public repositories.
-Use --token or GITHUB_TOKEN for private repos and higher rate limits.
-Use --git to scan full git history (slower but finds deleted secrets).`,
+Supports github.com and GitHub Enterprise Server instances.
+
+Authentication:
+  No token needed for public repositories (60 requests/hour).
+  Use --token or GITHUB_TOKEN env var for private repos and higher rate limits (5000/hour).
+
+GitHub Enterprise:
+  Use --url or GITHUB_BASE_URL env var to point at a GHE Server instance.
+  Example: --url https://github.example.com
+
+Rate limiting:
+  Use --rate-limit to add a delay between repository clones (recommended for large, self-hosted orgs).
+  Example: --rate-limit 2 adds a 2-second delay between each repo.
+
+Examples:
+  titus github praetorian-inc/titus                          # single public repo
+  titus github --token ghp_xxx --org praetorian-inc          # all repos in org
+  titus github --url https://ghe.corp.com --token ghp_xxx --org myorg --rate-limit 2
+  titus github --token ghp_xxx --user octocat --git          # user repos with full history`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runGitHubScan,
 }
@@ -38,28 +58,34 @@ var githubScanCmd = &cobra.Command{
 	Short: "Scan GitHub repository or organization",
 	Long: `Scan a single repo (owner/repo), all repos in an org (--org), or all repos for a user (--user).
 Repositories are cloned and scanned for current files by default.
-No API token needed for public repositories.
-Use --git to also scan full git history.`,
+Use --git to also scan full git history (slower but finds deleted secrets).
+Use --no-clone to fetch files via API instead of cloning (requires token).`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runGitHubScan,
 }
 
 func init() {
 	githubScanCmd.Flags().StringVar(&githubToken, "token", "", "GitHub API token (or GITHUB_TOKEN env; optional for public repos)")
+	githubScanCmd.Flags().StringVar(&githubBaseURL, "url", "", "GitHub Enterprise base URL (or GITHUB_BASE_URL env; e.g., https://github.example.com)")
 	githubScanCmd.Flags().StringVar(&githubOrg, "org", "", "Scan all repositories in organization")
 	githubScanCmd.Flags().StringVar(&githubUser, "user", "", "Scan all repositories for user")
-	githubScanCmd.Flags().StringVar(&githubOutputPath, "output", "titus.db", "Output database path")
+	githubScanCmd.Flags().StringVar(&githubOutputPath, "output", "titus.db", "Output database path (:memory: for in-memory, :auto: to derive from target name)")
 	githubScanCmd.Flags().StringVar(&githubOutputFormat, "format", "human", "Output format: json, human")
 	githubScanCmd.Flags().BoolVar(&githubNoClone, "no-clone", false, "Fetch files via API instead of cloning (requires token, no git history)")
 	githubScanCmd.Flags().BoolVar(&githubGit, "git", false, "Scan full git history (slower; default scans only current files)")
+	githubScanCmd.Flags().BoolVar(&githubSkipForks, "skip-forks", false, "Skip forked repositories when scanning orgs or users")
+	githubScanCmd.Flags().Float64Var(&githubRateLimit, "rate-limit", 0, "Delay in seconds between repository clones (e.g., 2 or 0.5; 0 = no delay)")
 
 	githubCmd.Flags().StringVar(&githubToken, "token", "", "GitHub API token (or GITHUB_TOKEN env; optional for public repos)")
+	githubCmd.Flags().StringVar(&githubBaseURL, "url", "", "GitHub Enterprise base URL (or GITHUB_BASE_URL env; e.g., https://github.example.com)")
 	githubCmd.Flags().StringVar(&githubOrg, "org", "", "Scan all repositories in organization")
 	githubCmd.Flags().StringVar(&githubUser, "user", "", "Scan all repositories for user")
-	githubCmd.Flags().StringVar(&githubOutputPath, "output", "titus.db", "Output database path")
+	githubCmd.Flags().StringVar(&githubOutputPath, "output", "titus.db", "Output database path (:memory: for in-memory, :auto: to derive from target name)")
 	githubCmd.Flags().StringVar(&githubOutputFormat, "format", "human", "Output format: json, human")
 	githubCmd.Flags().BoolVar(&githubNoClone, "no-clone", false, "Fetch files via API instead of cloning (requires token, no git history)")
 	githubCmd.Flags().BoolVar(&githubGit, "git", false, "Scan full git history (slower; default scans only current files)")
+	githubCmd.Flags().BoolVar(&githubSkipForks, "skip-forks", false, "Skip forked repositories when scanning orgs or users")
+	githubCmd.Flags().Float64Var(&githubRateLimit, "rate-limit", 0, "Delay in seconds between repository clones (e.g., 2 or 0.5; 0 = no delay)")
 
 	githubCmd.AddCommand(githubScanCmd)
 }
@@ -70,13 +96,29 @@ func runGitHubScan(cmd *cobra.Command, args []string) error {
 		token = os.Getenv("GITHUB_TOKEN")
 	}
 
+	baseURL := githubBaseURL
+	if baseURL == "" {
+		baseURL = os.Getenv("GITHUB_BASE_URL")
+	}
+
 	if githubNoClone && token == "" {
 		return fmt.Errorf("--no-clone requires a GitHub API token: use --token or GITHUB_TOKEN")
 	}
 
 	if token == "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Note: No GitHub token provided. Using unauthenticated access (60 requests/hour, public repos only).\n")
-		fmt.Fprintf(cmd.ErrOrStderr(), "Set GITHUB_TOKEN or use --token for higher rate limits and private repo access.\n\n")
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Note: No GitHub token provided. Using unauthenticated access (60 requests/hour, public repos only).\n")
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Set GITHUB_TOKEN or use --token for higher rate limits and private repo access.\n\n")
+	}
+
+	if baseURL != "" {
+		insecure, err := enum.ValidateBaseURL(baseURL)
+		if err != nil {
+			return fmt.Errorf("invalid --url: %w", err)
+		}
+		if insecure && token != "" {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: Using HTTP with an API token. Your token will be sent in plaintext.\n")
+		}
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Using GitHub Enterprise: %s\n", baseURL)
 	}
 
 	var owner, repo string
@@ -88,16 +130,22 @@ func runGitHubScan(cmd *cobra.Command, args []string) error {
 		owner, repo = parts[0], parts[1]
 	}
 
+	if githubOutputPath == ":auto:" {
+		githubOutputPath = resolveAutoName(githubOrg, githubUser, repo)
+	}
+
 	if repo == "" && githubOrg == "" && githubUser == "" {
 		return fmt.Errorf("must specify owner/repo, --org, or --user")
 	}
 
 	ghEnum, err := enum.NewGitHubEnumerator(enum.GitHubConfig{
-		Token: token,
-		Owner: owner,
-		Repo:  repo,
-		Org:   githubOrg,
-		User:  githubUser,
+		Token:     token,
+		BaseURL:   baseURL,
+		Owner:     owner,
+		Repo:      repo,
+		Org:       githubOrg,
+		User:      githubUser,
+		SkipForks: githubSkipForks,
 		Config: enum.Config{
 			MaxFileSize: 10 * 1024 * 1024,
 		},
@@ -123,7 +171,7 @@ func runGitHubScan(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating matcher: %w", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	s, err := store.New(store.Config{
 		Path: githubOutputPath,
@@ -131,7 +179,7 @@ func runGitHubScan(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating store: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	for _, r := range rules {
 		if err := s.AddRule(r); err != nil {
@@ -145,18 +193,22 @@ func runGitHubScan(cmd *cobra.Command, args []string) error {
 	if githubNoClone {
 		enumerator = ghEnum
 	} else {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Enumerating repositories...\n")
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Enumerating repositories...\n")
 		repos, err := ghEnum.ListRepoURLs(ctx)
 		if err != nil {
 			return fmt.Errorf("listing repositories: %w", err)
 		}
 
-		fmt.Fprintf(cmd.ErrOrStderr(), "Found %d repositories to scan\n\n", len(repos))
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Found %d repositories to scan\n\n", len(repos))
 
 		cloneEnum := enum.NewCloneEnumerator(repos, enum.Config{
 			MaxFileSize: 10 * 1024 * 1024,
 		})
 		cloneEnum.Git = githubGit
+		cloneEnum.Token = token
+		if githubRateLimit > 0 {
+			cloneEnum.Delay = time.Duration(githubRateLimit * float64(time.Second))
+		}
 		enumerator = cloneEnum
 	}
 
@@ -223,8 +275,8 @@ func runGitHubScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("scanning GitHub: %w", err)
 	}
 
-	fmt.Fprintf(cmd.OutOrStdout(), "GitHub scan complete: %d matches, %d findings\n", matchCount, findingCount)
-	fmt.Fprintf(cmd.OutOrStdout(), "Results stored in: %s\n", githubOutputPath)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "GitHub scan complete: %d matches, %d findings\n", matchCount, findingCount)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Results stored in: %s\n", githubOutputPath)
 
 	if githubOutputFormat == "json" {
 		matches, err := s.GetAllMatches()

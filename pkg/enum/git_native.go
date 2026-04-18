@@ -27,14 +27,17 @@ func gitBinaryAvailable() bool {
 
 // enumerateAllHistoryNative uses native git commands for fast history enumeration.
 // Phase 1: git rev-list --all --objects → collect unique blob hashes with paths.
-// Phase 2: git cat-file --batch → stream content, filter, and invoke callback.
+// Phase 2: git log → collect commit metadata keyed by file path.
+// Phase 3: git cat-file --batch → stream content, filter, and invoke callback.
 func (e *GitEnumerator) enumerateAllHistoryNative(ctx context.Context, callback func(content []byte, blobID types.BlobID, prov types.Provenance) error) error {
 	blobs, err := e.collectBlobEntries(ctx)
 	if err != nil {
 		return err
 	}
 
-	return e.streamBlobContents(ctx, blobs, callback)
+	commitMap, _ := e.collectCommitMetadata(ctx) // best-effort; nil map is safe
+
+	return e.streamBlobContentsWithMeta(ctx, blobs, commitMap, callback)
 }
 
 // collectBlobEntries runs git rev-list --all --objects and returns deduplicated blob entries.
@@ -98,8 +101,14 @@ func (e *GitEnumerator) collectBlobEntries(ctx context.Context) ([]blobEntry, er
 	return blobs, nil
 }
 
-// streamBlobContents feeds hashes to git cat-file --batch and invokes callback for text blobs.
-func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntry, callback func(content []byte, blobID types.BlobID, prov types.Provenance) error) error {
+// collectCommitMetadata runs git log to build a map of file path → first commit metadata.
+func (e *GitEnumerator) collectCommitMetadata(ctx context.Context) (map[string]*types.CommitMetadata, error) {
+	return collectCommitMetadataForRepo(ctx, e.config.Root, true)
+}
+
+// streamBlobContentsWithMeta feeds hashes to git cat-file --batch and invokes callback for text blobs.
+// If commitMap is non-nil, attaches commit metadata to git provenance records.
+func (e *GitEnumerator) streamBlobContentsWithMeta(ctx context.Context, blobs []blobEntry, commitMap map[string]*types.CommitMetadata, callback func(content []byte, blobID types.BlobID, prov types.Provenance) error) error {
 	if len(blobs) == 0 {
 		return nil
 	}
@@ -128,7 +137,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 		if i%1000 == 0 {
 			select {
 			case <-ctx.Done():
-				stdin.Close()
+				_ = stdin.Close()
 				_ = cmd.Wait()
 				return ctx.Err()
 			default:
@@ -137,7 +146,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 
 		hexStr := hex.EncodeToString(blob.hash[:])
 		if _, err := fmt.Fprintf(stdin, "%s\n", hexStr); err != nil {
-			stdin.Close()
+			_ = stdin.Close()
 			_ = cmd.Wait()
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -148,7 +157,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 		// Read response header: "<hash> <type> <size>\n"
 		headerLine, err := reader.ReadString('\n')
 		if err != nil {
-			stdin.Close()
+			_ = stdin.Close()
 			_ = cmd.Wait()
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -166,7 +175,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 		objType := parts[1]
 		size, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
-			stdin.Close()
+			_ = stdin.Close()
 			_ = cmd.Wait()
 			return fmt.Errorf("git cat-file: parse size %q: %w", parts[2], err)
 		}
@@ -174,7 +183,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 		// Non-blob objects: discard content + trailing newline.
 		if objType != "blob" {
 			if _, err := io.CopyN(io.Discard, reader, size+1); err != nil {
-				stdin.Close()
+				_ = stdin.Close()
 				_ = cmd.Wait()
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -187,7 +196,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 		// Oversized blobs: discard.
 		if e.config.MaxFileSize > 0 && size > e.config.MaxFileSize {
 			if _, err := io.CopyN(io.Discard, reader, size+1); err != nil {
-				stdin.Close()
+				_ = stdin.Close()
 				_ = cmd.Wait()
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -200,7 +209,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 		// Read blob content.
 		content := make([]byte, size)
 		if _, err := io.ReadFull(reader, content); err != nil {
-			stdin.Close()
+			_ = stdin.Close()
 			_ = cmd.Wait()
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -210,7 +219,7 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 
 		// Consume trailing newline.
 		if _, err := reader.ReadByte(); err != nil {
-			stdin.Close()
+			_ = stdin.Close()
 			_ = cmd.Wait()
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -228,18 +237,18 @@ func (e *GitEnumerator) streamBlobContents(ctx context.Context, blobs []blobEntr
 
 		prov := types.GitProvenance{
 			RepoPath: e.config.Root,
-			Commit:   nil,
+			Commit:   commitMap[blob.path],
 			BlobPath: blob.path,
 		}
 
 		if err := callback(content, blobID, prov); err != nil {
-			stdin.Close()
+			_ = stdin.Close()
 			_ = cmd.Wait()
 			return err
 		}
 	}
 
-	stdin.Close()
+	_ = stdin.Close()
 
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() != nil {

@@ -5,9 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/praetorian-inc/titus/pkg/types"
 )
 
@@ -28,10 +30,14 @@ const (
 	overlayHelp
 	overlaySource
 	overlayComment
+	overlayExclude
 )
 
 // pagerFinishedMsg is sent when an external pager process exits.
 type pagerFinishedMsg struct{ err error }
+
+// clearFlashMsg clears the flash status message after a delay.
+type clearFlashMsg struct{}
 
 // Model is the root Bubble Tea model for the explore TUI.
 type Model struct {
@@ -57,9 +63,23 @@ type Model struct {
 	commentTarget string // "finding" or "match"
 	commentID     string
 
+	// Exclusion filter state
+	excludePatterns   []string
+	excludeInput      string
+	excludeCursor     int
+	excludeInListMode bool
+
+	// Filter pane width (percentage of terminal width)
+	filterWidthPct int
+
+	// Flash message (temporary status)
+	flashMsg string
+
+	// Pending clipboard data (written via OSC 52 on next render)
+	pendingClipboard string
+
 	width  int
 	height int
-	err    error
 }
 
 // New creates a new Model by loading data from the given datastore path.
@@ -72,12 +92,13 @@ func New(datastorePath string) (Model, error) {
 	facets := buildFacets(data.findings)
 
 	m := Model{
-		data:        data,
-		filters:     newFilterPane(facets),
-		findings:    newFindingsPane(data.findings),
-		details:     newDetailsPane(),
-		focus:       paneFindings,
-		showFilters: true,
+		data:           data,
+		filters:        newFilterPane(facets),
+		findings:       newFindingsPane(data.findings),
+		details:        newDetailsPane(),
+		focus:          paneFindings,
+		showFilters:    true,
+		filterWidthPct: 30,
 	}
 
 	// Set initial focus
@@ -96,6 +117,9 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Clear pending clipboard after one render cycle
+	m.pendingClipboard = ""
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -107,8 +131,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Pager exited, TUI resumes automatically
 		return m, nil
 
+	case clearFlashMsg:
+		m.flashMsg = ""
+		return m, nil
+
 	case tea.MouseMsg:
 		if m.activeOverlay != overlayNone {
+			return m, nil
+		}
+		// Handle scroll wheel
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			m.handleMouseScroll(msg.X, msg.Y, msg.Button == tea.MouseButtonWheelUp)
 			return m, nil
 		}
 		if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
@@ -137,6 +170,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case keyMatches(msg, defaultKeys.ToggleFilters):
 			m.showFilters = !m.showFilters
 			m.updateLayout()
+			return m, nil
+		case keyMatches(msg, defaultKeys.Exclude):
+			m.activeOverlay = overlayExclude
+			m.excludeInput = ""
+			m.excludeInListMode = false
+			m.excludeCursor = 0
+			return m, nil
+		case keyMatches(msg, defaultKeys.FilterWider):
+			if m.showFilters && m.filterWidthPct < 80 {
+				m.filterWidthPct += 5
+			}
+			return m, nil
+		case keyMatches(msg, defaultKeys.FilterNarrower):
+			if m.showFilters && m.filterWidthPct > 10 {
+				m.filterWidthPct -= 5
+			}
 			return m, nil
 		case keyMatches(msg, defaultKeys.FocusFilters):
 			m.setFocus(paneFilters)
@@ -171,6 +220,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case keyMatches(msg, defaultKeys.OpenSource):
 				cmd := m.openSource()
+				return m, cmd
+			case keyMatches(msg, defaultKeys.CopySecret):
+				cmd := m.copySecretToClipboard()
 				return m, cmd
 			}
 		}
@@ -208,7 +260,8 @@ func (m *Model) updateOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch {
 		case keyMatches(msg, defaultKeys.Quit),
 			keyMatches(msg, defaultKeys.ForceQuit),
-			keyMatches(msg, defaultKeys.ToggleHelp):
+			keyMatches(msg, defaultKeys.ToggleHelp),
+			keyMatches(msg, defaultKeys.Escape):
 			m.activeOverlay = overlayNone
 		case keyMatches(msg, defaultKeys.Down):
 			m.helpOffset++
@@ -254,6 +307,59 @@ func (m *Model) updateOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.commentInput += msg.String()
 			}
 		}
+	case overlayExclude:
+		if !m.excludeInListMode {
+			switch msg.String() {
+			case "enter":
+				pattern := strings.TrimSpace(m.excludeInput)
+				if pattern != "" {
+					m.excludePatterns = append(m.excludePatterns, pattern)
+					m.excludeInput = ""
+				}
+			case "tab":
+				if len(m.excludePatterns) > 0 {
+					m.excludeInListMode = true
+					m.excludeCursor = 0
+				}
+			case "esc", "ctrl+c":
+				m.activeOverlay = overlayNone
+				m.applyFilters()
+			case "backspace":
+				if len(m.excludeInput) > 0 {
+					m.excludeInput = m.excludeInput[:len(m.excludeInput)-1]
+				}
+			default:
+				if len(msg.String()) == 1 || msg.String() == " " {
+					m.excludeInput += msg.String()
+				}
+			}
+		} else {
+			switch msg.String() {
+			case "j", "down":
+				if m.excludeCursor < len(m.excludePatterns)-1 {
+					m.excludeCursor++
+				}
+			case "k", "up":
+				if m.excludeCursor > 0 {
+					m.excludeCursor--
+				}
+			case "x", "d", "backspace":
+				if m.excludeCursor < len(m.excludePatterns) {
+					m.excludePatterns = append(m.excludePatterns[:m.excludeCursor], m.excludePatterns[m.excludeCursor+1:]...)
+					if m.excludeCursor >= len(m.excludePatterns) {
+						m.excludeCursor = max(0, len(m.excludePatterns)-1)
+					}
+					if len(m.excludePatterns) == 0 {
+						m.excludeInListMode = false
+					}
+				}
+			case "tab":
+				m.excludeInListMode = false
+			case "esc", "ctrl+c":
+				m.activeOverlay = overlayNone
+				m.applyFilters()
+			}
+		}
 	}
 	return m, nil
 }
@@ -276,7 +382,7 @@ func (m Model) View() string {
 
 	var mainContent string
 	if m.showFilters {
-		filtersWidth := min(m.width*30/100, 50)
+		filtersWidth := m.width * m.filterWidthPct / 100
 		dataWidth := m.width - filtersWidth
 
 		findingsHeight := contentHeight * 40 / 100
@@ -305,21 +411,40 @@ func (m Model) View() string {
 		mainContent = lipgloss.JoinVertical(lipgloss.Left, findingsView, detailsView)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, mainContent, statusBar)
+	result := lipgloss.JoinVertical(lipgloss.Left, mainContent, statusBar)
+
+	// Emit OSC 52 clipboard sequence if pending (terminal intercepts, not visible)
+	if m.pendingClipboard != "" {
+		result += ansi.SetSystemClipboard(m.pendingClipboard)
+	}
+
+	return result
 }
 
 func (m *Model) renderStatusBar() string {
-	left := statusBarStyle.Render(fmt.Sprintf(" %d findings | %d filtered",
-		len(m.data.findings), len(m.findings.rows)))
+	var left string
+	if m.flashMsg != "" {
+		left = statusBarStyle.Render(" " + m.flashMsg)
+	} else {
+		exclusionInfo := ""
+		if len(m.excludePatterns) > 0 {
+			exclusionInfo = fmt.Sprintf(" | %d exclusion(s)", len(m.excludePatterns))
+		}
+		left = statusBarStyle.Render(fmt.Sprintf(" %d findings | %d filtered%s",
+			len(m.data.findings), len(m.findings.rows), exclusionInfo))
+	}
 
-	right := fmt.Sprintf("%s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s",
+	right := fmt.Sprintf("%s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s  %s:%s",
 		helpKeyStyle.Render("j/k"), helpDescStyle.Render("nav"),
 		helpKeyStyle.Render("f/d"), helpDescStyle.Render("focus"),
 		helpKeyStyle.Render("a/r"), helpDescStyle.Render("accept/reject"),
 		helpKeyStyle.Render("c"), helpDescStyle.Render("comment"),
+		helpKeyStyle.Render("y"), helpDescStyle.Render("copy"),
 		helpKeyStyle.Render("s"), helpDescStyle.Render("sort"),
 		helpKeyStyle.Render("o"), helpDescStyle.Render("source"),
 		helpKeyStyle.Render("F7"), helpDescStyle.Render("filters"),
+		helpKeyStyle.Render("/"), helpDescStyle.Render("exclude"),
+		helpKeyStyle.Render("[/]"), helpDescStyle.Render("resize"),
 		helpKeyStyle.Render("?"), helpDescStyle.Render("help"),
 	)
 
@@ -350,6 +475,11 @@ func (m *Model) renderOverlay() string {
 		overlayWidth = min(60, m.width-4)
 		overlayHeight = 5
 		content = fmt.Sprintf("\n  > %s_\n", m.commentInput)
+	case overlayExclude:
+		title = " Exclude Patterns (esc to close) "
+		overlayWidth = min(70, m.width-4)
+		overlayHeight = min(20, max(8, len(m.excludePatterns)+8))
+		content = m.renderExcludeContent()
 	}
 
 	box := modalStyle.
@@ -392,6 +522,31 @@ func (m *Model) renderSourceContent(width, height int) string {
 	return strings.Join(visible, "\n")
 }
 
+func (m *Model) renderExcludeContent() string {
+	var sb strings.Builder
+	sb.WriteString("\n  Enter pattern (case-sensitive substring match on repo paths):\n")
+
+	if !m.excludeInListMode {
+		fmt.Fprintf(&sb, "  > %s_\n", m.excludeInput)
+	} else {
+		fmt.Fprintf(&sb, "    %s\n", m.excludeInput)
+	}
+
+	if len(m.excludePatterns) > 0 {
+		sb.WriteString("\n  Active patterns (tab to switch, x to delete):\n")
+		for i, p := range m.excludePatterns {
+			if m.excludeInListMode && i == m.excludeCursor {
+				fmt.Fprintf(&sb, "  > %s\n", rejectStyle.Render(p))
+			} else {
+				fmt.Fprintf(&sb, "    %s\n", p)
+			}
+		}
+	}
+
+	sb.WriteString("\n  enter:add  tab:switch  x:delete  esc:close")
+	return sb.String()
+}
+
 func (m *Model) setFocus(p focusedPane) {
 	m.filters.focused = p == paneFilters
 	m.findings.focused = p == paneFindings
@@ -403,7 +558,7 @@ func (m *Model) handleMouseClick(x, y int) {
 	contentHeight := m.height - 2
 
 	if m.showFilters {
-		filtersWidth := min(m.width*30/100, 50)
+		filtersWidth := m.width * m.filterWidthPct / 100
 		findingsHeight := contentHeight * 40 / 100
 
 		if x < filtersWidth && y < contentHeight {
@@ -458,22 +613,94 @@ func (m *Model) handleMouseClick(x, y int) {
 	}
 }
 
-func (m *Model) applyFilters() {
-	if !m.filters.facets.hasActiveFilters() {
-		m.findings.setFilteredRows(m.data.findings)
-	} else {
-		var filtered []*findingRow
-		for _, f := range m.data.findings {
-			if m.filters.facets.matchesFinding(f) {
-				filtered = append(filtered, f)
+func (m *Model) handleMouseScroll(x, y int, up bool) {
+	scrollLines := 3
+	contentHeight := m.height - 2
+
+	// Determine which pane the mouse is over
+	pane := m.hitTestPane(x, y, contentHeight)
+
+	switch pane {
+	case paneFilters:
+		for i := 0; i < scrollLines; i++ {
+			if up {
+				if m.filters.cursor > 0 {
+					m.filters.cursor--
+				}
+			} else {
+				if m.filters.cursor < len(m.filters.items)-1 {
+					m.filters.cursor++
+				}
 			}
 		}
-		m.findings.setFilteredRows(filtered)
+		m.filters.ensureVisible()
+
+	case paneFindings:
+		prevCursor := m.findings.cursor
+		for i := 0; i < scrollLines; i++ {
+			if up {
+				if m.findings.cursor > 0 {
+					m.findings.cursor--
+				}
+			} else {
+				if m.findings.cursor < len(m.findings.rows)-1 {
+					m.findings.cursor++
+				}
+			}
+		}
+		m.findings.ensureVisible()
+		if m.findings.cursor != prevCursor {
+			if f := m.findings.selectedFinding(); f != nil {
+				m.details.setFinding(f)
+			}
+		}
+
+	case paneDetails:
+		for i := 0; i < scrollLines; i++ {
+			if up {
+				if m.details.offset > 0 {
+					m.details.offset--
+				}
+			} else {
+				m.details.offset++
+			}
+		}
 	}
-	// Update facet counts based on all findings (not just filtered)
+}
+
+// hitTestPane determines which pane the given coordinates fall in.
+func (m *Model) hitTestPane(x, y, contentHeight int) focusedPane {
+	if m.showFilters {
+		filtersWidth := m.width * m.filterWidthPct / 100
+		findingsHeight := contentHeight * 40 / 100
+		if x < filtersWidth {
+			return paneFilters
+		} else if y < findingsHeight {
+			return paneFindings
+		}
+		return paneDetails
+	}
+	findingsHeight := contentHeight * 40 / 100
+	if y < findingsHeight {
+		return paneFindings
+	}
+	return paneDetails
+}
+
+func (m *Model) applyFilters() {
+	var filtered []*findingRow
+	for _, f := range m.data.findings {
+		if m.filters.facets.hasActiveFilters() && !m.filters.facets.matchesFinding(f) {
+			continue
+		}
+		if m.matchesExclusion(f) {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	m.findings.setFilteredRows(filtered)
 	m.filters.facets.updateCounts(m.data.findings)
 
-	// Update details
 	if f := m.findings.selectedFinding(); f != nil {
 		m.details.setFinding(f)
 	} else {
@@ -481,8 +708,60 @@ func (m *Model) applyFilters() {
 	}
 }
 
+// matchesExclusion returns true if a finding should be excluded based on
+// active exclusion patterns. Case-sensitive substring match on repo paths.
+func (m *Model) matchesExclusion(f *findingRow) bool {
+	if len(m.excludePatterns) == 0 {
+		return false
+	}
+	for _, repo := range f.Repositories {
+		for _, pattern := range m.excludePatterns {
+			if strings.Contains(repo, pattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *Model) copySecretToClipboard() tea.Cmd {
+	var secret string
+
+	// If viewing a match in details, copy the match's highlighted value
+	if m.focus == paneDetails && m.details.finding != nil {
+		matches := m.details.finding.Matches
+		if m.details.matchCursor < len(matches) {
+			match := matches[m.details.matchCursor]
+			secret = string(match.Snippet.Matching)
+		}
+	}
+
+	// Fall back to finding's first group
+	if secret == "" {
+		f := m.findings.selectedFinding()
+		if f == nil || len(f.Groups) == 0 {
+			m.flashMsg = "No secret to copy"
+			return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearFlashMsg{} })
+		}
+		secret = string(f.Groups[0])
+	}
+
+	// Set clipboard via OSC 52 (written to terminal on next render)
+	m.pendingClipboard = secret
+
+	// Flash message
+	display := secret
+	if len(display) > 40 {
+		display = display[:40] + "..."
+	}
+	m.flashMsg = fmt.Sprintf("Copied: %s", display)
+
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearFlashMsg{} })
+}
+
 func (m *Model) setAnnotation(status string) {
-	if m.focus == paneFindings {
+	switch m.focus {
+	case paneFindings:
 		f := m.findings.selectedFinding()
 		if f == nil {
 			return
@@ -495,7 +774,7 @@ func (m *Model) setAnnotation(status string) {
 			f.AnnotationStatus = status
 			_ = m.data.setFindingAnnotation(f.FindingID, status, f.Comment)
 		}
-	} else if m.focus == paneDetails {
+	case paneDetails:
 		match := m.details.selectedMatch()
 		if match == nil {
 			return
@@ -511,7 +790,8 @@ func (m *Model) setAnnotation(status string) {
 }
 
 func (m *Model) moveNext() {
-	if m.focus == paneFindings {
+	switch m.focus {
+	case paneFindings:
 		if m.findings.cursor < len(m.findings.rows)-1 {
 			m.findings.cursor++
 			m.findings.ensureVisible()
@@ -519,7 +799,7 @@ func (m *Model) moveNext() {
 				m.details.setFinding(f)
 			}
 		}
-	} else if m.focus == paneDetails {
+	case paneDetails:
 		if m.finding() != nil && m.details.matchCursor < len(m.finding().Matches)-1 {
 			m.details.matchCursor++
 		}
@@ -531,7 +811,8 @@ func (m *Model) finding() *findingRow {
 }
 
 func (m *Model) startComment() {
-	if m.focus == paneFindings {
+	switch m.focus {
+	case paneFindings:
 		f := m.findings.selectedFinding()
 		if f == nil {
 			return
@@ -539,7 +820,7 @@ func (m *Model) startComment() {
 		m.commentTarget = "finding"
 		m.commentID = f.FindingID
 		m.commentInput = f.Comment
-	} else if m.focus == paneDetails {
+	case paneDetails:
 		match := m.details.selectedMatch()
 		if match == nil {
 			return
@@ -552,13 +833,14 @@ func (m *Model) startComment() {
 }
 
 func (m *Model) saveComment() {
-	if m.commentTarget == "finding" {
+	switch m.commentTarget {
+	case "finding":
 		f := m.findings.selectedFinding()
 		if f != nil {
 			f.Comment = m.commentInput
 			_ = m.data.setFindingAnnotation(f.FindingID, f.AnnotationStatus, f.Comment)
 		}
-	} else if m.commentTarget == "match" {
+	case "match":
 		match := m.details.selectedMatch()
 		if match != nil {
 			match.Comment = m.commentInput
@@ -648,6 +930,14 @@ FILTERS
   x or Space        Toggle filter value
   Ctrl+r            Reset all filters
 
+EXCLUSIONS
+  /                 Open exclusion pattern editor
+                    Patterns are case-sensitive substring matches
+                    Applied to repository paths
+
+LAYOUT
+  [/]               Resize filter pane (narrower/wider)
+
 ANNOTATIONS
   a                 Toggle accept on finding/match
   r                 Toggle reject on finding/match
@@ -659,6 +949,11 @@ VIEWS
   s                 Cycle sort column
   o                 Open source (pager for files, overlay for git)
   ?                 Toggle this help screen
+
+CLIPBOARD
+  y                 Copy secret value to clipboard
+
+TIP: Hold Shift to select text with your mouse in the TUI.
 
 QUIT
   q                 Quit

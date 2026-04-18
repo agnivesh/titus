@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/praetorian-inc/titus/pkg/enum"
 	"github.com/praetorian-inc/titus/pkg/matcher"
@@ -21,6 +22,7 @@ var (
 	gitlabOutputFormat string
 	gitlabNoClone      bool
 	gitlabGit          bool
+	gitlabRateLimit    float64
 )
 
 var gitlabCmd = &cobra.Command{
@@ -50,19 +52,21 @@ func init() {
 	gitlabScanCmd.Flags().StringVar(&gitlabGroup, "group", "", "Scan all projects in group")
 	gitlabScanCmd.Flags().StringVar(&gitlabUser, "user", "", "Scan all projects for user")
 	gitlabScanCmd.Flags().StringVar(&gitlabBaseURL, "url", "", "GitLab base URL (default: gitlab.com)")
-	gitlabScanCmd.Flags().StringVar(&gitlabOutputPath, "output", "titus.db", "Output database path")
+	gitlabScanCmd.Flags().StringVar(&gitlabOutputPath, "output", "titus.db", "Output database path (:memory: for in-memory, :auto: to derive from target name)")
 	gitlabScanCmd.Flags().StringVar(&gitlabOutputFormat, "format", "human", "Output format: json, human")
 	gitlabScanCmd.Flags().BoolVar(&gitlabNoClone, "no-clone", false, "Fetch files via API instead of cloning (requires token, no git history)")
 	gitlabScanCmd.Flags().BoolVar(&gitlabGit, "git", false, "Scan full git history (slower; default scans only current files)")
+	gitlabScanCmd.Flags().Float64Var(&gitlabRateLimit, "rate-limit", 0, "Delay in seconds between project clones (e.g., 2 or 0.5; 0 = no delay)")
 
 	gitlabCmd.Flags().StringVar(&gitlabToken, "token", "", "GitLab token (or GITLAB_TOKEN env; optional for public projects)")
 	gitlabCmd.Flags().StringVar(&gitlabGroup, "group", "", "Scan all projects in group")
 	gitlabCmd.Flags().StringVar(&gitlabUser, "user", "", "Scan all projects for user")
 	gitlabCmd.Flags().StringVar(&gitlabBaseURL, "url", "", "GitLab base URL (default: gitlab.com)")
-	gitlabCmd.Flags().StringVar(&gitlabOutputPath, "output", "titus.db", "Output database path")
+	gitlabCmd.Flags().StringVar(&gitlabOutputPath, "output", "titus.db", "Output database path (:memory: for in-memory, :auto: to derive from target name)")
 	gitlabCmd.Flags().StringVar(&gitlabOutputFormat, "format", "human", "Output format: json, human")
 	gitlabCmd.Flags().BoolVar(&gitlabNoClone, "no-clone", false, "Fetch files via API instead of cloning (requires token, no git history)")
 	gitlabCmd.Flags().BoolVar(&gitlabGit, "git", false, "Scan full git history (slower; default scans only current files)")
+	gitlabCmd.Flags().Float64Var(&gitlabRateLimit, "rate-limit", 0, "Delay in seconds between project clones (e.g., 2 or 0.5; 0 = no delay)")
 
 	gitlabCmd.AddCommand(gitlabScanCmd)
 }
@@ -78,8 +82,26 @@ func runGitLabScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if token == "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Note: No GitLab token provided. Using unauthenticated access (public projects only).\n")
-		fmt.Fprintf(cmd.ErrOrStderr(), "Set GITLAB_TOKEN or use --token for private project access.\n\n")
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Note: No GitLab token provided. Using unauthenticated access (public projects only).\n")
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Set GITLAB_TOKEN or use --token for private project access.\n\n")
+	}
+
+	if gitlabBaseURL != "" {
+		insecure, err := enum.ValidateBaseURL(gitlabBaseURL)
+		if err != nil {
+			return fmt.Errorf("invalid --url: %w", err)
+		}
+		if insecure && token != "" {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: Using HTTP with an API token. Your token will be sent in plaintext.\n")
+		}
+	}
+
+	if gitlabOutputPath == ":auto:" {
+		var project string
+		if len(args) > 0 {
+			project = args[0]
+		}
+		gitlabOutputPath = resolveAutoName(gitlabGroup, gitlabUser, project)
 	}
 
 	var project string
@@ -119,13 +141,13 @@ func runGitLabScan(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating matcher: %w", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	s, err := store.New(store.Config{Path: gitlabOutputPath})
 	if err != nil {
 		return fmt.Errorf("creating store: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	for _, r := range rules {
 		if err := s.AddRule(r); err != nil {
@@ -139,18 +161,22 @@ func runGitLabScan(cmd *cobra.Command, args []string) error {
 	if gitlabNoClone {
 		enumerator = glEnum
 	} else {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Enumerating projects...\n")
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Enumerating projects...\n")
 		projects, err := glEnum.ListProjectURLs(ctx)
 		if err != nil {
 			return fmt.Errorf("listing projects: %w", err)
 		}
 
-		fmt.Fprintf(cmd.ErrOrStderr(), "Found %d projects to scan\n\n", len(projects))
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Found %d projects to scan\n\n", len(projects))
 
 		cloneEnum := enum.NewCloneEnumerator(projects, enum.Config{
 			MaxFileSize: 10 * 1024 * 1024,
 		})
 		cloneEnum.Git = gitlabGit
+		cloneEnum.Token = token
+		if gitlabRateLimit > 0 {
+			cloneEnum.Delay = time.Duration(gitlabRateLimit * float64(time.Second))
+		}
 		enumerator = cloneEnum
 	}
 
@@ -217,8 +243,8 @@ func runGitLabScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("scanning: %w", err)
 	}
 
-	fmt.Fprintf(cmd.OutOrStdout(), "GitLab scan complete: %d matches, %d findings\n", matchCount, findingCount)
-	fmt.Fprintf(cmd.OutOrStdout(), "Results stored in: %s\n", gitlabOutputPath)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "GitLab scan complete: %d matches, %d findings\n", matchCount, findingCount)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Results stored in: %s\n", gitlabOutputPath)
 
 	if gitlabOutputFormat == "json" {
 		matches, err := s.GetAllMatches()

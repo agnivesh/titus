@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"net/url"
+
 	"github.com/google/go-github/v57/github"
 	"golang.org/x/oauth2"
 
@@ -14,12 +16,14 @@ import (
 
 // GitHubConfig configures GitHub API enumeration.
 type GitHubConfig struct {
-	Token  string // GitHub API token (optional; unauthenticated if empty)
-	Owner  string // Repository owner (for single repo)
-	Repo   string // Repository name (for single repo)
-	Org    string // Organization name (list all org repos)
-	User   string // User name (list all user repos)
-	Config        // Embedded base config
+	Token     string // GitHub API token (optional; unauthenticated if empty)
+	BaseURL   string // GitHub Enterprise base URL (optional; defaults to github.com)
+	Owner     string // Repository owner (for single repo)
+	Repo      string // Repository name (for single repo)
+	Org       string // Organization name (list all org repos)
+	User      string // User name (list all user repos)
+	SkipForks bool   // Skip forked repositories when scanning orgs/users
+	Config           // Embedded base config
 }
 
 // GitHubEnumerator enumerates blobs from GitHub via API.
@@ -43,6 +47,23 @@ func NewGitHubEnumerator(cfg GitHubConfig) (*GitHubEnumerator, error) {
 		client = github.NewClient(nil)
 	}
 
+	// Configure custom base URL for GitHub Enterprise
+	if cfg.BaseURL != "" {
+		if _, err := ValidateBaseURL(cfg.BaseURL); err != nil {
+			return nil, fmt.Errorf("GitHub Enterprise URL: %w", err)
+		}
+		baseURL, err := url.Parse(strings.TrimSuffix(cfg.BaseURL, "/") + "/api/v3/")
+		if err != nil {
+			return nil, fmt.Errorf("parsing GitHub Enterprise URL: %w", err)
+		}
+		uploadURL, err := url.Parse(strings.TrimSuffix(cfg.BaseURL, "/") + "/api/uploads/")
+		if err != nil {
+			return nil, fmt.Errorf("parsing GitHub Enterprise upload URL: %w", err)
+		}
+		client.BaseURL = baseURL
+		client.UploadURL = uploadURL
+	}
+
 	return &GitHubEnumerator{
 		client: client,
 		config: cfg,
@@ -58,6 +79,9 @@ func (e *GitHubEnumerator) Enumerate(ctx context.Context, callback func(content 
 
 	// Enumerate each repository
 	for _, repo := range repos {
+		if e.config.SkipForks && repo.GetFork() {
+			continue
+		}
 		if err := e.enumerateRepo(ctx, repo, callback); err != nil {
 			return fmt.Errorf("enumerating %s: %w", repo.GetFullName(), err)
 		}
@@ -120,25 +144,38 @@ func (e *GitHubEnumerator) listOrgRepos(ctx context.Context) ([]*github.Reposito
 
 // listUserRepos lists all repositories for a user.
 func (e *GitHubEnumerator) listUserRepos(ctx context.Context) ([]*github.Repository, error) {
-	opts := &github.RepositoryListOptions{
-		ListOptions: github.ListOptions{PerPage: 100},
-	}
-
 	var allRepos []*github.Repository
-	for {
-		repos, resp, err := e.client.Repositories.List(ctx, e.config.User, opts)
-		if err != nil {
-			return nil, fmt.Errorf("listing user repositories: %w", err)
+	if e.config.User != "" {
+		opts := &github.RepositoryListByUserOptions{
+			ListOptions: github.ListOptions{PerPage: 100},
 		}
-
-		allRepos = append(allRepos, repos...)
-
-		if resp.NextPage == 0 {
-			break
+		for {
+			repos, resp, err := e.client.Repositories.ListByUser(ctx, e.config.User, opts)
+			if err != nil {
+				return nil, fmt.Errorf("listing user repositories: %w", err)
+			}
+			allRepos = append(allRepos, repos...)
+			if resp.NextPage == 0 {
+				break
+			}
+			opts.Page = resp.NextPage
 		}
-		opts.Page = resp.NextPage
+	} else {
+		opts := &github.RepositoryListByAuthenticatedUserOptions{
+			ListOptions: github.ListOptions{PerPage: 100},
+		}
+		for {
+			repos, resp, err := e.client.Repositories.ListByAuthenticatedUser(ctx, opts)
+			if err != nil {
+				return nil, fmt.Errorf("listing user repositories: %w", err)
+			}
+			allRepos = append(allRepos, repos...)
+			if resp.NextPage == 0 {
+				break
+			}
+			opts.Page = resp.NextPage
+		}
 	}
-
 	return allRepos, nil
 }
 
@@ -151,6 +188,9 @@ func (e *GitHubEnumerator) ListRepoURLs(ctx context.Context) ([]RepoInfo, error)
 
 	var urls []RepoInfo
 	for _, repo := range repos {
+		if e.config.SkipForks && repo.GetFork() {
+			continue
+		}
 		urls = append(urls, RepoInfo{
 			Name:          repo.GetFullName(),
 			CloneURL:      repo.GetCloneURL(),

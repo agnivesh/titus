@@ -34,12 +34,23 @@ type keyMap struct {
 	ToggleHelp    key.Binding
 	ToggleFilters key.Binding
 
+	// Clipboard
+	CopySecret key.Binding
+
 	// Sort
 	SortNext key.Binding
+
+	// Exclusion filter
+	Exclude key.Binding
+
+	// Filter pane resize
+	FilterWider    key.Binding
+	FilterNarrower key.Binding
 
 	// Quit
 	Quit      key.Binding
 	ForceQuit key.Binding
+	Escape    key.Binding
 }
 
 var defaultKeys = keyMap{
@@ -127,9 +138,25 @@ var defaultKeys = keyMap{
 		key.WithKeys("f7"),
 		key.WithHelp("F7", "filters"),
 	),
+	CopySecret: key.NewBinding(
+		key.WithKeys("y"),
+		key.WithHelp("y", "copy secret"),
+	),
 	SortNext: key.NewBinding(
 		key.WithKeys("s"),
 		key.WithHelp("s", "sort"),
+	),
+	Exclude: key.NewBinding(
+		key.WithKeys("/"),
+		key.WithHelp("/", "exclude"),
+	),
+	FilterWider: key.NewBinding(
+		key.WithKeys("]"),
+		key.WithHelp("]", "wider filters"),
+	),
+	FilterNarrower: key.NewBinding(
+		key.WithKeys("["),
+		key.WithHelp("[", "narrower filters"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q"),
@@ -138,5 +165,9 @@ var defaultKeys = keyMap{
 	ForceQuit: key.NewBinding(
 		key.WithKeys("ctrl+c"),
 		key.WithHelp("C-c", "quit"),
+	),
+	Escape: key.NewBinding(
+		key.WithKeys("esc"),
+		key.WithHelp("esc", "close overlay"),
 	),
 }
